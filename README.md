@@ -2,7 +2,7 @@
 
 **The ultimate Linux script to wipe, encrypt, format, and mount USB drives – safely and interactively.**
 
-Built by the HACKER_BRAIN system, this tool lets you **zero or shred** your device, optionally **encrypt** with LUKS, **partition**, **format** (ext4, exFAT, FAT32, NTFS), and **mount** it — all in a clean Bash CLI interface.
+ this tool lets you **zero or shred** your device, optionally **encrypt** with LUKS, **partition**, **format** (ext4, exFAT, FAT32, NTFS), and **mount** it — all in a clean Bash CLI interface.
 
 ---
 

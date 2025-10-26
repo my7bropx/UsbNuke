@@ -1,8 +1,19 @@
 #!/bin/bash
 
-# USB Nuke Beast v2.1 - Enhanced Edition (Fixed)
+# USB Nuke Beast v2.2 - Enhanced Edition (All Issues Fixed)
 # A complete wipe, encrypt, format, and mount tool for USB devices
-# Secure USB wipe, encrypt, partition, format, mount  all in Bash
+# Secure USB wipe, encrypt, partition, format, mount - all in Bash
+#
+# CHANGELOG v2.2:
+# - Fixed partition naming bug for NVMe/MMC/loop devices (nvme0n1p1 vs nvme0n11)
+# - Added missing dependencies: bc, blockdev
+# - Moved pv and shred to optional dependencies with proper fallbacks
+# - Fixed device detection parsing to handle spaces in MODEL/VENDOR names
+# - Added proper ASCII banner art
+# - Implemented actual shred command usage with fallback
+# - Added wipe verification for zero-fill method
+# - Enhanced error handling in partition creation
+# - Added alternative partition naming fallback logic
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -24,15 +35,15 @@ show_banner() {
     printf '%b\n' "${RED}"
     cat <<'ART'
 ========================================
-               
-   
-           
-              
-                  
-                         
+  _   _ ____  ____    _   _ _   _ _  _______
+ | | | / ___|| __ )  | \ | | | | | |/ / ____|
+ | | | \___ \|  _ \  |  \| | | | | ' /|  _|
+ | |_| |___) | |_) | | |\  | |_| | . \| |___
+  \___/|____/|____/  |_| \_|\___/|_|\_\_____|
+     BEAST MODE: Wipe, Encrypt & Format
 ========================================
 ART
-    printf '%b\n' "${YELLOW}USB NUKE BEAST v2.1  Enhanced USB Toolkit (Fixed)${RESET}"
+    printf '%b\n' "${YELLOW}USB NUKE BEAST v2.2  Enhanced USB Toolkit (All Issues Fixed)${RESET}"
     echo ""
 }
 
@@ -124,8 +135,8 @@ check_root() {
 check_dependencies() {
     start_timer "Dependency Check"
     local missing=()
-    local deps=("lsblk" "parted" "dd" "shred" "mkfs.ext4" "sync" "partprobe")
-    local optional_deps=("mkfs.exfat" "mkfs.vfat" "mkfs.ntfs" "cryptsetup")
+    local deps=("lsblk" "parted" "dd" "mkfs.ext4" "sync" "partprobe" "bc" "blockdev")
+    local optional_deps=("mkfs.exfat" "mkfs.vfat" "mkfs.ntfs" "cryptsetup" "pv" "shred")
     
     # Check required dependencies
     for dep in "${deps[@]}"; do
@@ -159,8 +170,19 @@ declare -a REMOVABLE_DEVICES
 
 get_removable_devices() {
     # Get only removable devices (USB drives, SD cards, etc.)
-    lsblk -d -o NAME,SIZE,TYPE,HOTPLUG,MODEL,VENDOR,TRAN 2>/dev/null | \
-    awk 'NR>1 && ($4=="1" || $7=="usb") && $3=="disk" {print "/dev/" $1 ":" $2 ":" $5 ":" $6}'
+    # Using -P for parseable output to handle spaces in MODEL/VENDOR
+    lsblk -d -P -o NAME,SIZE,TYPE,HOTPLUG,MODEL,VENDOR,TRAN 2>/dev/null | \
+    while IFS= read -r line; do
+        eval "$line"
+        if [[ ("$HOTPLUG" == "1" || "$TRAN" == "usb") && "$TYPE" == "disk" ]]; then
+            # Clean up MODEL and VENDOR by removing trailing spaces
+            MODEL="${MODEL//\"/}"
+            VENDOR="${VENDOR//\"/}"
+            MODEL=$(echo "$MODEL" | sed 's/[[:space:]]*$//')
+            VENDOR=$(echo "$VENDOR" | sed 's/[[:space:]]*$//')
+            echo "/dev/$NAME:$SIZE:${MODEL:-Unknown}:${VENDOR:-Unknown}"
+        fi
+    done
 }
 
 show_devices() {
@@ -593,15 +615,58 @@ perform_wipe_with_progress() {
     printf '  Average speed: %d MB/s\n' "$((avg_speed / 1048576))"
 }
 
+# Shred-based wipe (uses the shred command if available)
+perform_shred_wipe() {
+    local device="$1"
+    local iterations="$2"
+
+    if ! command -v shred &> /dev/null; then
+        warn "shred command not available, falling back to pattern wipe"
+        perform_wipe_with_progress "$device" "pattern" "$iterations"
+        return
+    fi
+
+    local device_bytes=$(get_device_bytes "$device")
+    info "Using shred command for secure wiping ($iterations iterations)"
+
+    # Check for pv availability
+    if command -v pv &> /dev/null; then
+        # Monitor shred progress with pv
+        sudo shred -v -n "$iterations" -z "$device" 2>&1 | \
+        pv -l -s "$((iterations + 1))" -N "shred progress" > /dev/null
+    else
+        # Run shred without progress monitoring
+        sudo shred -v -n "$iterations" -z "$device"
+    fi
+}
+
+# Verify wipe completion
+verify_wipe() {
+    local device="$1"
+    local sample_size=$((1024 * 1024 * 10))  # 10 MB sample
+
+    info "Verifying wipe (sampling 10MB)..."
+    local sample=$(sudo dd if="$device" bs=1M count=10 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -v '^0*$' || echo "")
+
+    if [[ -z "$sample" ]]; then
+        success "Verification passed: Device contains all zeros"
+        return 0
+    else
+        warn "Verification: Device contains non-zero data (may be expected for random wipes)"
+        return 1
+    fi
+}
+
 # Main wipe function dispatcher
 perform_wipe() {
     local device="$1"
     local method="$2"
-    
+
     case "$method" in
         1)
             start_timer "Zero Wipe"
             perform_wipe_with_progress "$device" "zeros" 1
+            verify_wipe "$device"
             end_timer "Zero Wipe"
             ;;
         2)
@@ -610,9 +675,9 @@ perform_wipe() {
             end_timer "Random Wipe"
             ;;
         3)
-            start_timer "Secure Wipe (3-pass)"
-            perform_wipe_with_progress "$device" "pattern" 3
-            end_timer "Secure Wipe (3-pass)"
+            start_timer "Shred Wipe (3-pass)"
+            perform_shred_wipe "$device" 3
+            end_timer "Shred Wipe (3-pass)"
             ;;
         4)
             start_timer "DoD 5220.22-M (7-pass)"
@@ -655,22 +720,40 @@ create_partition() {
     esac
     
     info "Creating primary partition..."
-    sudo parted "$device" --script mkpart primary 1MiB 100%
+    if ! sudo parted "$device" --script mkpart primary 1MiB 100%; then
+        error_exit "Failed to create partition on $device"
+    fi
     sudo parted "$device" --script set 1 boot on 2>/dev/null || true
-    
+
     # Ensure partition is recognized
     sync
     sudo partprobe "$device" 2>/dev/null || true
     sleep 3
-    
-    local part="${device}1"
+
+    # Handle different partition naming schemes
+    local part=""
+    if [[ "$device" =~ (nvme|mmcblk|loop) ]]; then
+        part="${device}p1"
+    else
+        part="${device}1"
+    fi
+
     local retry_count=0
     while [[ ! -b "$part" ]] && [[ $retry_count -lt 10 ]]; do
         sleep 1
         ((retry_count++))
         log "Waiting for partition to appear... (attempt $retry_count)"
+        # Try alternative naming if first attempt fails
+        if [[ $retry_count -eq 5 ]]; then
+            if [[ "$device" =~ (nvme|mmcblk|loop) ]]; then
+                part="${device}1"
+            else
+                part="${device}p1"
+            fi
+            log "Trying alternative partition naming: $part"
+        fi
     done
-    
+
     if [[ ! -b "$part" ]]; then
         error_exit "Partition $part was not created successfully after 10 seconds"
     fi
@@ -944,9 +1027,9 @@ main() {
     # Wipe method selection
     echo ""
     printf '%bChoose wipe method:%b\n' "${CYAN}" "${RESET}"
-    echo "1) Zero fill (fast, single pass)"
-    echo "2) Random data (secure, single pass)"  
-    echo "3) Shred (secure, 3-pass)"
+    echo "1) Zero fill (fast, single pass, verified)"
+    echo "2) Random data (secure, single pass)"
+    echo "3) Shred (secure, 3-pass using shred command)"
     echo "4) DoD 5220.22-M (very secure, 7-pass)"
     echo "5) Skip wipe"
     

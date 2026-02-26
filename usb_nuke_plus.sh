@@ -1,28 +1,9 @@
 #!/bin/bash
 
-# USB Nuke Beast v2.2 — Fixed Edition
+# USB Nuke Beast v2.2
 # A complete wipe, encrypt, format, and mount tool for USB devices
-#
-# FIXES APPLIED:
-# [1] set -euo pipefail → set -uo pipefail  (removed -e: it silently kills the script
-#     when info/warn/log are called inside $(...) subshell captures)
-# [2] check_dependencies: added /sbin /usr/sbin /usr/local/sbin search so tools like
-#     partprobe, mkfs.ext4, cryptsetup, blockdev are found even when not in $PATH
-# [3] create_partition: all info/success/warn/log calls redirected to >&2 so that
-#     PART=$(...) captures only the partition path, not a wall of log text
-# [4] setup_encryption: same >&2 fix so MAPPED_DEV=$(...) captures only the mapper path
-# [5] dd wipe: replaced unreliable /proc/pid/io monitor with dd's native
-#     status=progress — gives real-time bytes/speed output, not silence for 10 minutes
-# [6] perform_wipe_with_progress: dd now runs in foreground with status=progress
-#     instead of background + polling; no more blank screen during wipe
-# [7] Nerd Font icons replace emoji throughout (requires Nerd Font terminal font)
-# [8] Added clear error/warning messages with context when operations fail
+set -uo pipefail  
 
-set -uo pipefail   # -e intentionally removed — see fix [1] above
-
-# ══════════════════════════════════════════════════════════════
-#  Colors
-# ══════════════════════════════════════════════════════════════
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
@@ -34,22 +15,17 @@ readonly BOLD='\033[1m'
 readonly DIM='\033[2m'
 readonly RESET='\033[0m'
 
-# Cursor helpers
+
 readonly HIDE_CURSOR='\033[?25l'
 readonly SHOW_CURSOR='\033[?25h'
 readonly ERASE_LINE='\033[2K'
 
-# ══════════════════════════════════════════════════════════════
-#  Global state
-# ══════════════════════════════════════════════════════════════
+
 readonly SCRIPT_START_TIME=$(date +%s)
 declare -A OPERATION_TIMES
 declare -a REMOVABLE_DEVICES
 
-# ══════════════════════════════════════════════════════════════
-#  Logging helpers
-#  FIX [3][4]: ALL helpers write to stderr (>&2) so $(...) captures stay clean
-# ══════════════════════════════════════════════════════════════
+
 get_timestamp() { date +'%H:%M:%S'; }
 
 log()        { printf '%b[%s] %s%b\n'        "${GRAY}"   "$(get_timestamp)" "$1" "${RESET}" >&2; }
@@ -58,10 +34,6 @@ warn()       { printf '%b\uf071 WARNING  %s%b\n'  "${YELLOW}" "$1"              
 success()    { printf '%b\uf058  %s%b\n'           "${GREEN}"  "$1"              "${RESET}" >&2; }
 info()       { printf '%b\uf05a INFO  %s%b\n'      "${BLUE}"   "$1"              "${RESET}" >&2; }
 
-# ══════════════════════════════════════════════════════════════
-#  _has_cmd — FIX [2]: checks PATH + all sbin locations
-#  partprobe, mkfs.*, cryptsetup, blockdev live in /sbin on many distros
-# ══════════════════════════════════════════════════════════════
 _has_cmd() {
     command -v "$1" &>/dev/null \
         || [[ -x "/sbin/$1" ]] \
@@ -69,9 +41,6 @@ _has_cmd() {
         || [[ -x "/usr/local/sbin/$1" ]]
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Spinner — for operations with no measurable progress
-# ══════════════════════════════════════════════════════════════
 _SPINNER_PID=""
 _SPINNER_LABEL=""
 
@@ -110,9 +79,7 @@ spinner_stop() {
     fi
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Utility functions
-# ══════════════════════════════════════════════════════════════
+
 format_duration() {
     local d=$1
     local h=$(( d/3600 )) m=$(( (d%3600)/60 )) s=$(( d%60 ))
@@ -133,8 +100,7 @@ format_bytes() {
 
 get_device_bytes() {
     local device="$1"
-    # Try lsblk first (no sudo), fall back to blockdev (needs sudo)
-    lsblk -bnd -o SIZE "$device" 2>/dev/null \
+        lsblk -bnd -o SIZE "$device" 2>/dev/null \
         || sudo blockdev --getsize64 "$device" 2>/dev/null \
         || echo 0
 }
@@ -151,9 +117,6 @@ end_timer() {
     success "Completed: $1  [$(format_duration $dur)]"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Banner
-# ══════════════════════════════════════════════════════════════
 show_banner() {
     printf '%b\n' "${RED}"
     cat <<'ART'
@@ -170,9 +133,6 @@ ART
     echo ""
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Safety checks
-# ══════════════════════════════════════════════════════════════
 check_root() {
     [[ $EUID -eq 0 ]] && error_exit "Don't run as root. The script uses sudo for individual commands."
 }
@@ -186,7 +146,6 @@ check_dependencies() {
     spinner_start "Checking required dependencies"
     sleep 0.3
 
-    # FIX [2]: check sbin paths too, not just $PATH
     for dep in "${deps[@]}"; do
         _has_cmd "$dep" || missing+=("$dep")
     done
@@ -207,9 +166,6 @@ check_dependencies() {
     end_timer "Dependency Check"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Device discovery
-# ══════════════════════════════════════════════════════════════
 get_removable_devices() {
     lsblk -d -P -o NAME,SIZE,TYPE,HOTPLUG,MODEL,VENDOR,TRAN 2>/dev/null | \
     while IFS= read -r line; do
@@ -254,10 +210,6 @@ show_devices() {
     end_timer "Device Discovery"
     echo "" >&2
 }
-
-# ══════════════════════════════════════════════════════════════
-#  Pre-nuke verification
-# ══════════════════════════════════════════════════════════════
 calc_destruction_data() {
     local device="$1"
     local total_bytes mounted_bytes=0 unmounted_count=0
@@ -341,9 +293,6 @@ pre_nuke_verification() {
     printf '%b  ALL DATA ON THIS DEVICE WILL BE PERMANENTLY DESTROYED!%b\n\n' "${RED}${BOLD}" "${RESET}" >&2
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Device validation
-# ══════════════════════════════════════════════════════════════
 validate_device() {
     local device="$1"
     start_timer "Device Validation"
@@ -409,9 +358,7 @@ validate_device() {
     end_timer "Device Validation"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Input helpers
-# ══════════════════════════════════════════════════════════════
+
 read_with_timeout() {
     local prompt="$1" timeout="${2:-30}" default="${3:-}" response
     [[ -n "$default" ]] && prompt="$prompt [default: $default]: " || prompt="$prompt: "
@@ -428,12 +375,7 @@ validate_numeric_choice() {
     [[ "$c" =~ ^[0-9]+$ ]] && (( c >= min && c <= max ))
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Progress bar for dd  — FIX [5][6]
-#  Replaces the silent background dd + /proc/pid/io monitor with
-#  dd's native status=progress piped through a live bar renderer.
-#  The user now sees real-time bytes + speed instead of nothing.
-# ══════════════════════════════════════════════════════════════
+
 _fmt_bytes_short() {
     local b=$1
     if   (( b >= 1073741824 )); then awk "BEGIN{printf \"%.1f GB\", $b/1073741824}"
@@ -454,41 +396,24 @@ _draw_bar() {
 progress_bar_dd() {
     local source="$1" dest="$2" total_bytes="$3" label="${4:-Writing...}"
 
-    # ── How this works ────────────────────────────────────────
-    # dd writes DATA to stdout and PROGRESS to stderr.
-    # We need both to go different places:
-    #   stdout  → the device (via sudo dd of=...)  [can't pipe this]
-    #   stderr  → our bar renderer
-    #
-    # Solution: run dd in background, redirect its stderr to a temp file,
-    # send SIGINT every second to make dd print a progress line, then
-    # read and render that file live. dd prints one progress line per USR1.
-    # On Linux, use SIGUSR1; on older dd it also works with kill -USR1.
-    # ─────────────────────────────────────────────────────────
-
-    local progress_file
+      local progress_file
     progress_file=$(mktemp /tmp/dd_progress.XXXXXX)
 
     printf "${HIDE_CURSOR}" >&2
 
-    # Run dd in background; stderr → progress_file
     sudo dd if="$source" of="$dest" bs=4M conv=fsync 2>"$progress_file" &
     local dd_pid=$!
 
     local start_sec=$SECONDS
     local last_written=0
 
-    # Poll loop — send USR1 every second to request a progress line from dd
     while kill -0 "$dd_pid" 2>/dev/null; do
-        # Signal dd to print current stats to its stderr (our progress_file)
         sudo kill -USR1 "$dd_pid" 2>/dev/null || true
         sleep 1
 
-        # Read the most recent bytes-progress line from the file
         local last_line
         last_line=$(grep -E "^[0-9]+ bytes" "$progress_file" 2>/dev/null | tail -n1 || true)
 
-        # dd progress line: "12345678 bytes (12 MB, 12 MiB) copied, 1.2 s, 10.3 MB/s"
         if [[ "$last_line" =~ ^([0-9]+)[[:space:]]bytes ]]; then
             local written="${BASH_REMATCH[1]}"
             local pct=0 speed="" eta_str=""
@@ -497,7 +422,6 @@ progress_bar_dd() {
 
             [[ "$last_line" =~ ([0-9.]+[[:space:]][KMGT]?B/s) ]] && speed="${BASH_REMATCH[1]}"
 
-            # Calculate ETA
             local elapsed=$(( SECONDS - start_sec ))
             if (( elapsed > 0 && written > 0 && total_bytes > written )); then
                 local rate=$(( written / elapsed ))
@@ -518,11 +442,9 @@ progress_bar_dd() {
         fi
     done
 
-    # Wait for dd to exit and capture its return code
     wait "$dd_pid" 2>/dev/null
     local rc=$?
 
-    # Print final state at 100%
     local bar; bar=$(_draw_bar 100)
     printf "\r  ${CYAN}%s${RESET} ${BOLD}%3d%%${RESET}  ${GRAY}%s / %s${RESET}   " \
         "$bar" 100 \
@@ -533,7 +455,6 @@ progress_bar_dd() {
     printf "\r${ERASE_LINE}" >&2
     printf "${SHOW_CURSOR}" >&2
 
-    # dd exits 1 on natural EOF (hit end of device) — expected and OK
     if [[ $rc -eq 0 || $rc -eq 1 ]]; then
         local elapsed=$(( SECONDS - start_sec ))
         local rate_str=""
@@ -548,9 +469,6 @@ progress_bar_dd() {
     fi
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Shred progress bar
-# ══════════════════════════════════════════════════════════════
 progress_shred() {
     local device="$1" passes="$2" label="${3:-Shredding...}"
     local total=$(( passes + 1 ))   # shred adds a final zero pass
@@ -558,10 +476,7 @@ progress_shred() {
     printf "${HIDE_CURSOR}" >&2
     info "$label  (${total} passes total)" >&2
 
-    # shred -v prints progress to stderr in the form:
-    #   shred: /dev/sdX: pass 2/4 (random)...14%
-    # We run it in background, stream its stderr to a temp file,
-    # and poll that file every second for updates.
+  
     local progress_file
     progress_file=$(mktemp /tmp/shred_progress.XXXXXX)
 
@@ -602,12 +517,7 @@ progress_shred() {
     return $rc
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Wipe functions
-# ══════════════════════════════════════════════════════════════
 
-# FIX [6]: perform_wipe_with_progress — replaced silent background dd with
-#          progress_bar_dd which uses dd status=progress for live feedback
 perform_wipe_with_progress() {
     local device="$1" method="$2" passes="$3"
     local device_bytes; device_bytes=$(get_device_bytes "$device")
@@ -710,10 +620,6 @@ perform_wipe() {
     esac
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Partition creation
-#  FIX [3]: ALL output redirected to >&2 so PART=$(...) captures only the path
-# ══════════════════════════════════════════════════════════════
 create_partition() {
     local device="$1" pt_type="$2"
     start_timer "Partition Creation"
@@ -752,7 +658,7 @@ create_partition() {
     sleep 3
     spinner_stop 0
 
-    # FIX: correct suffix for nvme/mmcblk/loop (p1) vs sda-style (1)
+    
     local part=""
     if [[ "$device" =~ (nvme|mmcblk|loop) ]]; then
         part="${device}p1"
@@ -764,7 +670,6 @@ create_partition() {
     local retry=0
     while [[ ! -b "$part" && $retry -lt 10 ]]; do
         sleep 1; ((retry++))
-        # After 5s try the alternative naming convention
         if [[ $retry -eq 5 ]]; then
             if [[ "$device" =~ (nvme|mmcblk|loop) ]]; then
                 part="${device}1"
@@ -782,13 +687,10 @@ create_partition() {
     spinner_stop 0
 
     end_timer "Partition Creation"
-    echo "$part"   # ← stdout only — all other output went to stderr via >&2
+    echo "$part"  
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Encryption
-#  FIX [4]: ALL output to >&2 so MAPPED_DEV=$(...) captures only the mapper path
-# ══════════════════════════════════════════════════════════════
+
 setup_encryption() {
     local part="$1" mapper_name="$2"
 
@@ -803,7 +705,7 @@ setup_encryption() {
     info "Setting up LUKS2 encryption (AES-XTS-512 + argon2id)..." >&2
     printf '\n%b  \uf071  You will be prompted for a passphrase TWICE.%b\n\n' "${YELLOW}" "${RESET}" >&2
 
-    # luksFormat is interactive — no spinner, user must type
+   
     if ! sudo cryptsetup luksFormat \
             --type luks2 \
             --cipher aes-xts-plain64 \
@@ -830,9 +732,7 @@ setup_encryption() {
     echo "$mapped"   # stdout only
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Filesystem formatting
-# ══════════════════════════════════════════════════════════════
+
 format_filesystem() {
     local device="$1" fstype="$2" label="${3:0:15}"
 
@@ -893,9 +793,7 @@ format_filesystem() {
     success "Filesystem created successfully"
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Mount
-# ══════════════════════════════════════════════════════════════
+
 mount_device() {
     local device="$1" mount_name="$2"
     local mount_dir="/mnt/$mount_name"
@@ -933,9 +831,7 @@ mount_device() {
     printf '%b  └──────────────────────────────────────────────┘%b\n\n' "${GRAY}" "${RESET}" >&2
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Summary + cleanup
-# ══════════════════════════════════════════════════════════════
+
 show_operation_summary() {
     local total=$(( $(date +%s) - SCRIPT_START_TIME ))
     printf '\n%b  ╔══ OPERATION SUMMARY ═════════════════════════╗%b\n' "${BOLD}${CYAN}" "${RESET}" >&2
@@ -966,9 +862,7 @@ cleanup() {
     exit $code
 }
 
-# ══════════════════════════════════════════════════════════════
-#  Main
-# ══════════════════════════════════════════════════════════════
+
 main() {
     trap cleanup EXIT
 

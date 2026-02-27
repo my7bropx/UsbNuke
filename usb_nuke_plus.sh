@@ -1,38 +1,73 @@
 #!/bin/bash
+# Requires: bash 4+, lsblk, parted, dd, mkfs.ext4, partprobe, bc
+# Optional: cryptsetup shred mkfs.exfat mkfs.vfat mkfs.ntfs
+set -o pipefail  
 
-# USB Nuke Beast v2.2
-# A complete wipe, encrypt, format, and mount tool for USB devices
-set -uo pipefail  
+R='\033[0;31m';  G='\033[0;32m';  Y='\033[1;33m';  B='\033[0;34m'
+C='\033[0;36m';  M='\033[0;35m';  W='\033[0;37m';  DK='\033[0;90m'
+LR='\033[1;31m'; LG='\033[1;32m'; LC='\033[1;36m'; LW='\033[1;37m'
+BO='\033[1m';    DIM='\033[2m';   IT='\033[3m';     UL='\033[4m'
+RST='\033[0m'
 
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly GRAY='\033[0;37m'
-readonly DARK='\033[0;90m'
-readonly BOLD='\033[1m'
-readonly DIM='\033[2m'
-readonly RESET='\033[0m'
+BG_BLK='\033[40m'; BG_RED='\033[41m'; BG_GRN='\033[42m'
+BG_YEL='\033[43m'; BG_BLU='\033[44m'; BG_MAG='\033[45m'
+BG_CYN='\033[46m'; BG_WHT='\033[47m'; BG_DK='\033[100m'
 
+HIDE='\033[?25l';       SHOW='\033[?25h'
+ALT_ON='\033[?1049h';   ALT_OFF='\033[?1049l'
+CLS='\033[2J';          HOME='\033[H'
 
-readonly HIDE_CURSOR='\033[?25l'
-readonly SHOW_CURSOR='\033[?25h'
-readonly ERASE_LINE='\033[2K'
+_IN_ALT=0   
 
-
-readonly SCRIPT_START_TIME=$(date +%s)
-declare -A OPERATION_TIMES
-declare -a REMOVABLE_DEVICES
+move()   { printf "\033[%d;%dH" "$1" "$2"; }
+clreos() { printf '\033[J'; }
 
 
-get_timestamp() { date +'%H:%M:%S'; }
+TW=80; TH=24
 
-log()        { printf '%b[%s] %s%b\n'        "${GRAY}"   "$(get_timestamp)" "$1" "${RESET}" >&2; }
-error_exit() { printf '\n%b\uf057 ERROR   %s%b\n'  "${RED}"    "$1"              "${RESET}" >&2; exit 1; }
-warn()       { printf '%b\uf071 WARNING  %s%b\n'  "${YELLOW}" "$1"              "${RESET}" >&2; }
-success()    { printf '%b\uf058  %s%b\n'           "${GREEN}"  "$1"              "${RESET}" >&2; }
-info()       { printf '%b\uf05a INFO  %s%b\n'      "${BLUE}"   "$1"              "${RESET}" >&2; }
+get_term_size() {
+    if command -v tput &>/dev/null && [[ -n "${TERM:-}" ]]; then
+        TW=$(tput cols  2>/dev/null || echo 80)
+        TH=$(tput lines 2>/dev/null || echo 24)
+        return
+    fi
+    local sz
+    if sz=$(stty size 2>/dev/null); then
+        TH=${sz%% *}; TW=${sz##* }
+        return
+    fi
+    TW=${COLUMNS:-80}; TH=${LINES:-24}
+}
+
+
+readonly SCRIPT_START=$(date +%s)
+declare -a USB_DEVICES=()
+
+SEL_DEVICE=""
+SEL_WIPE=0
+SEL_PTABLE=1
+SEL_FS=1
+SEL_LABEL="NUKED"
+SEL_ENCRYPT=0
+SEL_MOUNT=0
+SEL_MOUNTNAME="usb"
+MAPPER_NAME=""
+CONFIRMED=0
+
+
+CFG_CUR_SECTION=0
+CFG_CUR_ITEM=0
+CFG_PANEL_R=4
+CFG_PANEL_C=3
+CFG_PANEL_W=80
+CFG_LEFT_W=44
+CFG_RIGHT_C=50
+CFG_RIGHT_W=30
+CFG_DEV_BYTES=0
+CFG_DEV_SIZE="?"
+CFG_DEV_MODEL="Unknown"
+
+EXEC_LOG_ROW=10
 
 _has_cmd() {
     command -v "$1" &>/dev/null \
@@ -41,1003 +76,1349 @@ _has_cmd() {
         || [[ -x "/usr/local/sbin/$1" ]]
 }
 
-_SPINNER_PID=""
-_SPINNER_LABEL=""
-
-_spinner_stop() {
-    if [[ -n "$_SPINNER_PID" ]] && kill -0 "$_SPINNER_PID" 2>/dev/null; then
-        kill "$_SPINNER_PID" 2>/dev/null
-        wait "$_SPINNER_PID" 2>/dev/null
-    fi
-    _SPINNER_PID=""
-    printf "${SHOW_CURSOR}" >&2
-}
-
-spinner_start() {
-    _SPINNER_LABEL="${1:-Working...}"
-    printf "${HIDE_CURSOR}" >&2
-    (
-        local frames=($'\ue22e' $'\ue22f' $'\ue230' $'\ue231' $'\ue232' $'\ue233')
-        local i=0
-        while true; do
-            printf "\r  ${CYAN}${frames[$((i % ${#frames[@]}))]}${RESET}  ${_SPINNER_LABEL}${DIM} ...${RESET}   " >&2
-            sleep 0.08
-            ((i++))
-        done
-    ) &
-    _SPINNER_PID=$!
-}
-
-spinner_stop() {
-    local rc="${1:-0}"
-    _spinner_stop
-    printf "\r${ERASE_LINE}" >&2
-    if [[ $rc -eq 0 ]]; then
-        printf "  ${GREEN}\uf058${RESET}  %s\n" "${_SPINNER_LABEL}" >&2
-    else
-        printf "  ${RED}\uf057${RESET}  %s ${RED}[failed — see error above]${RESET}\n" "${_SPINNER_LABEL}" >&2
-    fi
-}
-
-
-format_duration() {
+fmt_dur() {
     local d=$1
     local h=$(( d/3600 )) m=$(( (d%3600)/60 )) s=$(( d%60 ))
-    (( h > 0 )) && printf "%dh %dm %ds" $h $m $s && return
-    (( m > 0 )) && printf "%dm %ds" $m $s && return
-    printf "%ds" $s
+    (( h > 0 )) && printf "%dh%02dm" "$h" "$m" && return
+    (( m > 0 )) && printf "%dm%02ds" "$m" "$s" && return
+    printf "%ds" "$s"
 }
 
-format_bytes() {
-    local b=$1
-    if   (( b >= 1099511627776 )); then awk "BEGIN{printf \"%.2f TiB\", $b/1099511627776}"
-    elif (( b >= 1073741824    )); then awk "BEGIN{printf \"%.2f GiB\", $b/1073741824}"
-    elif (( b >= 1048576       )); then awk "BEGIN{printf \"%.2f MiB\", $b/1048576}"
-    elif (( b >= 1024          )); then awk "BEGIN{printf \"%.2f KiB\", $b/1024}"
-    else printf "%d B" "$b"
+fmt_bytes() {
+    local b="${1:-0}"
+    if   (( b >= 1099511627776 )); then awk "BEGIN{printf \"%.1fT\",$b/1099511627776}"
+    elif (( b >= 1073741824    )); then awk "BEGIN{printf \"%.1fG\",$b/1073741824}"
+    elif (( b >= 1048576       )); then awk "BEGIN{printf \"%.1fM\",$b/1048576}"
+    elif (( b >= 1024          )); then awk "BEGIN{printf \"%.1fK\",$b/1024}"
+    else printf "%dB" "$b"
     fi
 }
 
 get_device_bytes() {
-    local device="$1"
-        lsblk -bnd -o SIZE "$device" 2>/dev/null \
-        || sudo blockdev --getsize64 "$device" 2>/dev/null \
-        || echo 0
+    local out
+    out=$(lsblk -bnd -o SIZE "$1" 2>/dev/null | tr -d ' \n') \
+        || out=$(sudo blockdev --getsize64 "$1" 2>/dev/null | tr -d ' \n')
+    printf '%s' "${out:-0}"
 }
 
-start_timer() {
-    OPERATION_TIMES["${1}_start"]=$(date +%s)
-    log "Starting: $1"
+repeat_char() {
+    local ch="$1" n="${2:-0}"
+    local i
+    for (( i=0; i<n; i++ )); do printf '%s' "$ch"; done
 }
 
-end_timer() {
-    local start=${OPERATION_TIMES["${1}_start"]:-$SCRIPT_START_TIME}
-    local dur=$(( $(date +%s) - start ))
-    OPERATION_TIMES["${1}_duration"]=$dur
-    success "Completed: $1  [$(format_duration $dur)]"
+hline() {
+    local row=$1 col=$2 w=$3 ch="${4:-─}" color="${5:-$DK}"
+    move "$row" "$col"
+    printf "%b" "$color"
+    repeat_char "$ch" "$w"
+    printf "%b" "$RST"
 }
 
-show_banner() {
-    printf '%b\n' "${RED}"
-    cat <<'ART'
-========================================
-  _   _ ____  ____    _   _ _   _ _  _______
- | | | / ___|| __ )  | \ | | | | | |/ / ____|
- | | | \___ \|  _ \  |  \| | | | | ' /|  _|
- | |_| |___) | |_) | | |\  | |_| | . \| |___
-  \___/|____/|____/  |_| \_|\___/|_|\_\_____|
-     BEAST MODE: Wipe, Encrypt & Format
-========================================
-ART
-    printf '%b\n' "${YELLOW}USB NUKE BEAST v2.2 — Enhanced USB Toolkit (Fixed Edition)${RESET}"
-    echo ""
-}
+draw_box() {
+    local r=$1 c=$2 h=$3 w=$4 col="${5:-$C}" title="${6:-}"
+    local inner=$(( w - 2 ))
 
-check_root() {
-    [[ $EUID -eq 0 ]] && error_exit "Don't run as root. The script uses sudo for individual commands."
-}
+    move "$r" "$c"
+    printf "%b╭" "$col"
+    if [[ -n "$title" ]]; then
+        local tlen=${#title}
+        local avail=$(( inner - tlen - 2 ))
+        (( avail < 0 )) && avail=0
+        local lpad=$(( avail / 2 ))
+        local rpad=$(( avail - lpad ))
+        repeat_char '─' "$lpad"
+        printf "┤ %b%b%s%b%b ├" "$BO" "$LW" "$title" "$RST" "$col"
+        repeat_char '─' "$rpad"
+    else
+        repeat_char '─' "$inner"
+    fi
+    printf "╮%b" "$RST"
 
-check_dependencies() {
-    start_timer "Dependency Check"
-    local missing=()
-    local deps=("lsblk" "parted" "dd" "mkfs.ext4" "sync" "partprobe" "bc" "blockdev")
-    local optional_deps=("mkfs.exfat" "mkfs.vfat" "mkfs.ntfs" "cryptsetup" "pv" "shred")
-
-    spinner_start "Checking required dependencies"
-    sleep 0.3
-
-    for dep in "${deps[@]}"; do
-        _has_cmd "$dep" || missing+=("$dep")
+    local i
+    for (( i=1; i<h-1; i++ )); do
+        move $(( r+i )) "$c"
+        printf "%b│%b%*s%b│%b" "$col" "$RST" "$inner" '' "$col" "$RST"
     done
+
+    move $(( r+h-1 )) "$c"
+    printf "%b╰" "$col"
+    repeat_char '─' "$inner"
+    printf "╯%b" "$RST"
+}
+
+clear_region() {
+    local r=$1 c=$2 h=$3 w=$4
+    local blank
+    blank=$(printf '%*s' "$w" '')
+    local i
+    for (( i=0; i<h; i++ )); do
+        move $(( r+i )) "$c"
+        printf '%s' "$blank"
+    done
+}
+
+draw_chrome() {
+    get_term_size
+    printf "%b%b%b" "$HIDE" "$CLS" "$HOME"
+
+    move 1 1
+    printf "%b%b%b" "$BG_DK" "$LC" "$BO"
+    printf '%*s' "$TW" '' | tr ' ' ' '
+    move 1 1
+    local title="  ☢  USB NUKE BEAST  v3.1  ─  Wipe · Encrypt · Format · Mount  ☢"
+    printf "%b%b%b%s%b" "$BG_DK" "$LC" "$BO" "$title" "$RST"
+    move 1 $(( TW - 19 ))
+    printf "%b%b%s%b" "$BG_DK" "$DK" "bash TUI  $(date +'%H:%M')" "$RST"
+
+    move "$TH" 1
+    printf "%b%b" "$BG_DK" "$DK"
+    printf '%*s' "$TW" '' | tr ' ' ' '
+    move "$TH" 1
+    printf "%b%b  ↑↓ navigate   Enter select   Tab toggle   Esc/q quit%b" "$BG_DK" "$DK" "$RST"
+    move "$TH" $(( TW - 24 ))
+    printf "%b%bCtrl+C to abort at any time%b" "$BG_DK" "$DK" "$RST"
+
+    move 2 1
+    printf "%b" "$DK"
+    repeat_char '─' "$TW"
+    printf "%b" "$RST"
+}
+
+screen_splash() {
+    draw_chrome
+
+    local art_row=4
+    local art=(
+        "  ███╗   ██╗██╗   ██╗██╗  ██╗███████╗    ██████╗ ███████╗ █████╗ ███████╗████████╗"
+        "  ████╗  ██║██║   ██║██║ ██╔╝██╔════╝    ██╔══██╗██╔════╝██╔══██╗██╔════╝╚══██╔══╝"
+        "  ██╔██╗ ██║██║   ██║█████╔╝ █████╗      ██████╔╝█████╗  ███████║███████╗   ██║   "
+        "  ██║╚██╗██║██║   ██║██╔═██╗ ██╔══╝      ██╔══██╗██╔══╝  ██╔══██║╚════██║   ██║   "
+        "  ██║ ╚████║╚██████╔╝██║  ██╗███████╗    ██████╔╝███████╗██║  ██║███████║   ██║   "
+        "  ╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝    ╚═════╝ ╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝  "
+    )
+
+    for line in "${art[@]}"; do
+        move "$art_row" 1
+        printf "%b%b%s%b" "$R" "$BO" "$line" "$RST"
+        (( art_row++ ))
+    done
+
+    move $(( art_row + 1 )) 1
+    printf "%b" "$DK"; repeat_char '─' "$TW"; printf "%b" "$RST"
+
+    move $(( art_row + 2 )) 4
+    printf "%b%bSecure USB wipe · encrypt · partition · format · mount%b" "$Y" "$BO" "$RST"
+    move $(( art_row + 3 )) 4
+    printf "%bAll operations run with sudo. You will be prompted when needed.%b" "$DK" "$RST"
+
+    local chk_row=$(( art_row + 5 ))
+    draw_box "$chk_row" 3 8 $(( TW - 4 )) "$C" "Startup Checks"
+    local r=$(( chk_row + 1 ))
+
+    # Root check
+    move "$r" 5; (( r++ ))
+    if [[ $EUID -eq 0 ]]; then
+        printf "%b%b ✗  Running as root%b  — re-run as a normal user (sudo is used per-command)" "$R" "$BO" "$RST"
+        move "$TH" 1
+        printf "%b%b  ERROR: Do not run as root. Exiting.  %b" "$BG_RED" "$LW" "$RST"
+        sleep 2; tui_quit 1
+    else
+        printf "%b ✓  Not root%b  — %bgood, sudo will be requested for individual commands%b" \
+            "$LG" "$RST" "$DK" "$RST"
+    fi
+
+    # Required deps
+    move "$r" 5; (( r++ ))
+    local missing=() ok=()
+    local deps=("lsblk" "parted" "dd" "mkfs.ext4" "partprobe" "blockdev")
+    local d
+    for d in "${deps[@]}"; do
+        _has_cmd "$d" && ok+=("$d") || missing+=("$d")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf "%b ✗  Missing: %s%b" "$R" "${missing[*]}" "$RST"
+        move "$r" 5; (( r++ ))
+        printf "%b    Install: sudo apt install parted e2fsprogs util-linux%b" "$Y" "$RST"
+    else
+        printf "%b ✓  Required tools found%b  — %b%s%b" "$LG" "$RST" "$DK" "${ok[*]}" "$RST"
+    fi
+
+    move "$r" 5; (( r++ ))
+    local opt_miss=()
+    local opt=("cryptsetup" "shred" "mkfs.exfat" "mkfs.vfat" "mkfs.ntfs")
+    for d in "${opt[@]}"; do
+        _has_cmd "$d" || opt_miss+=("$d")
+    done
+    if [[ ${#opt_miss[@]} -gt 0 ]]; then
+        printf "%b ⚠  Optional missing: %b%s%b  (some features unavailable)" \
+            "$Y" "$DK" "${opt_miss[*]}" "$RST"
+    else
+        printf "%b ✓  All optional tools found%b" "$LG" "$RST"
+    fi
+
+    # Kernel info
+    move "$r" 5
+    local kver; kver=$(uname -r 2>/dev/null || echo "unknown")
+    printf "%b ℹ  Kernel %s   │   %s%b" "$DK" "$kver" "$(date)" "$RST"
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        spinner_stop 1
-        error_exit "Missing required tools: ${missing[*]}\nInstall: sudo apt install parted e2fsprogs coreutils bc util-linux"
-    fi
-    spinner_stop 0
-
-    local missing_opt=()
-    for dep in "${optional_deps[@]}"; do
-        _has_cmd "$dep" || missing_opt+=("$dep")
-    done
-    [[ ${#missing_opt[@]} -gt 0 ]] && \
-        warn "Optional tools not found: ${missing_opt[*]} (some options will be unavailable)"
-
-    end_timer "Dependency Check"
-}
-
-get_removable_devices() {
-    lsblk -d -P -o NAME,SIZE,TYPE,HOTPLUG,MODEL,VENDOR,TRAN 2>/dev/null | \
-    while IFS= read -r line; do
-        eval "$line"
-        if [[ ("$HOTPLUG" == "1" || "$TRAN" == "usb") && "$TYPE" == "disk" ]]; then
-            MODEL="${MODEL//\"/}"; MODEL="${MODEL%"${MODEL##*[![:space:]]}"}"
-            VENDOR="${VENDOR//\"/}"; VENDOR="${VENDOR%"${VENDOR##*[![:space:]]}"}"
-            echo "/dev/$NAME:$SIZE:${MODEL:-Unknown}:${VENDOR:-Unknown}"
-        fi
-    done
-}
-
-show_devices() {
-    start_timer "Device Discovery"
-    printf '%b\uf7c8  Available Removable Storage Devices%b\n' "${BLUE}${BOLD}" "${RESET}" >&2
-    printf '%b  ┌──────┬──────────┬─────────────────┬──────────┐%b\n' "${BLUE}" "${RESET}" >&2
-    printf '%b  │  #   │   Size   │   Model         │  Vendor  │%b\n' "${CYAN}" "${RESET}" >&2
-    printf '%b  ├──────┼──────────┼─────────────────┼──────────┤%b\n' "${BLUE}" "${RESET}" >&2
-
-    local count=0
-    REMOVABLE_DEVICES=()
-
-    while IFS=':' read -r device size model vendor; do
-        if [[ -n "$device" && -b "$device" ]]; then
-            REMOVABLE_DEVICES+=("$device")
-            printf '%b  │  %-4d│  %-7s │  %-15s│  %-8s│%b\n' \
-                "${CYAN}" "$((++count))" "$size" "${model:-Unknown}" "${vendor:-Unknown}" "${RESET}" >&2
-        fi
-    done < <(get_removable_devices)
-
-    printf '%b  └──────┴──────────┴─────────────────┴──────────┘%b\n' "${BLUE}" "${RESET}" >&2
-
-    if [[ $count -eq 0 ]]; then
-        warn "No removable USB devices detected!"
-        printf '%b\n  \uf071  TIP: Make sure your USB is plugged in and try: lsblk -o NAME,HOTPLUG,TRAN%b\n' "${YELLOW}" "${RESET}" >&2
-        printf '%b  All block devices for reference:%b\n' "${GRAY}" "${RESET}" >&2
-        lsblk -o NAME,SIZE,TYPE,MODEL 2>/dev/null | grep "disk" | grep -v "loop" | sed 's/^/    /' >&2
-        error_exit "No removable devices found. Connect a USB drive and rerun."
+        move $(( chk_row + 8 )) 5
+        printf "%b%b Cannot continue — fix missing dependencies above.%b" "$R" "$BO" "$RST"
+        move "$TH" 1
+        printf "%b%b  Press any key to exit...%b" "$BG_DK" "$Y" "$RST"
+        read -rsn1; tui_quit 1
     fi
 
-    log "Found $count removable device(s)"
-    end_timer "Device Discovery"
-    echo "" >&2
+    move $(( chk_row + 7 )) 1
+    printf "%b" "$DK"; repeat_char '─' "$TW"; printf "%b" "$RST"
+    move $(( TH - 1 )) 1
+    printf "%b  Press %b%bEnter%b%b to continue...%b" "$C" "$RST" "$BO" "$RST" "$C" "$RST"
+    read -rsn1
 }
-calc_destruction_data() {
-    local device="$1"
-    local total_bytes mounted_bytes=0 unmounted_count=0
-    total_bytes=$(get_device_bytes "$device")
 
+scan_devices() {
+    USB_DEVICES=()
+    local line NAME SIZE MODEL TRAN HOTPLUG dev
     while IFS= read -r line; do
-        local mountpoint part_type
-        mountpoint=$(echo "$line" | awk '{print $1}')
-        part_type=$(echo  "$line" | awk '{print $2}')
-        if [[ "$part_type" == "part" && -n "$mountpoint" && "$mountpoint" != "" ]]; then
-            local used
-            used=$(df -B1 --output=used "$mountpoint" 2>/dev/null | tail -n +2 | tr -d ' ' || echo 0)
-            mounted_bytes=$(( mounted_bytes + used ))
-        elif [[ "$part_type" == "part" ]]; then
-            ((unmounted_count++))
+        NAME=""   SIZE=""   MODEL=""   TRAN=""   HOTPLUG=""
+        [[ "$line" =~ NAME=\"([^\"]*)\" ]]    && NAME="${BASH_REMATCH[1]}"
+        [[ "$line" =~ SIZE=\"([^\"]*)\" ]]    && SIZE="${BASH_REMATCH[1]}"
+        [[ "$line" =~ MODEL=\"([^\"]*)\" ]]   && MODEL="${BASH_REMATCH[1]}"
+        [[ "$line" =~ TRAN=\"([^\"]*)\" ]]    && TRAN="${BASH_REMATCH[1]}"
+        [[ "$line" =~ HOTPLUG=\"([^\"]*)\" ]] && HOTPLUG="${BASH_REMATCH[1]}"
+
+        dev="/dev/$NAME"
+        [[ -b "$dev" ]]                                  || continue
+        [[ "$TRAN" == "usb" || "$HOTPLUG" == "1" ]]     || continue
+        [[ "$NAME" =~ ^(loop|sr) ]]                      && continue
+
+        MODEL="${MODEL%"${MODEL##*[![:space:]]}"}"
+        USB_DEVICES+=("$dev:$SIZE:${MODEL:-Unknown}:${TRAN:-?}:${HOTPLUG:-0}")
+    done < <(lsblk -d -P -o NAME,SIZE,MODEL,TRAN,HOTPLUG 2>/dev/null)
+}
+
+_DS_SELECTED=0
+_DS_LIST_W=0
+_DS_LIST_START=0
+_DS_INNER_R=0
+_DS_INNER_H=0
+_DS_PANEL_C=0
+_DS_DETAIL_C=0
+_DS_DETAIL_W=0
+_DS_PANEL_H=0
+_DS_PANEL_R=0
+
+_ds_draw_device_list() {
+    local idx dev size model tran hotplug
+    for (( idx=0; idx<${#USB_DEVICES[@]}; idx++ )); do
+        IFS=: read -r dev size model tran hotplug <<< "${USB_DEVICES[$idx]}"
+        move $(( _DS_LIST_START + idx )) $(( _DS_PANEL_C + 1 ))
+        if [[ $idx -eq $_DS_SELECTED ]]; then
+            printf "%b%b%b" "$BG_DK" "$LC" "$BO"
+        else
+            printf "%b" "$RST"
         fi
-    done < <(lsblk -rno MOUNTPOINT,TYPE "$device" 2>/dev/null)
-
-    echo "$total_bytes:$mounted_bytes:$unmounted_count"
+        printf " %-7s %-8s %-17s %-5s%b" \
+            "${dev##*/}" "$size" "${model:0:17}" "$tran" "$RST"
+    done
+    for (( idx=${#USB_DEVICES[@]}; idx<_DS_INNER_H-3; idx++ )); do
+        move $(( _DS_LIST_START + idx )) $(( _DS_PANEL_C + 1 ))
+        printf '%*s' $(( _DS_LIST_W - 1 )) ''
+    done
 }
 
-list_mounted_contents() {
-    local device="$1" max_items="${2:-20}" has_mounted=false
+_ds_draw_device_detail() {
+    local dr=$(( _DS_INNER_R ))
+    local dev_entry="${USB_DEVICES[$_DS_SELECTED]:-}"
+    local dw=$(( _DS_DETAIL_W - 1 ))
 
-    while IFS=' ' read -r part_path mountpoint; do
-        if [[ -n "$mountpoint" ]]; then
-            has_mounted=true
-            printf '%b  \uf0c8  %s  →  %s%b\n' "${CYAN}" "$part_path" "$mountpoint" "${RESET}" >&2
-            local total_files
-            total_files=$(find "$mountpoint" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
-            printf '%b  Files/dirs: %d%b\n' "${GRAY}" "$total_files" "${RESET}" >&2
-            if [[ $total_files -gt 0 ]]; then
-                ls -A1 "$mountpoint" 2>/dev/null | head -n "$max_items" | while read -r item; do
-                    [[ -d "$mountpoint/$item" ]] && printf '    \uf74a %s/\n' "$item" >&2 \
-                                                 || printf '    \uf15b %s\n'  "$item" >&2
-                done
-                (( total_files > max_items )) && \
-                    printf '%b    ... and %d more%b\n' "${GRAY}" "$(( total_files - max_items ))" "${RESET}" >&2
-            fi
-            echo "" >&2
-        fi
-    done < <(lsblk -rno PATH,MOUNTPOINT,TYPE "$device" 2>/dev/null | awk '$3=="part" {print $1, $2}')
+    local di
+    for (( di=0; di<_DS_INNER_H-2; di++ )); do
+        move $(( dr + di )) "$_DS_DETAIL_C"
+        printf '%*s' "$dw" ''
+    done
 
-    [[ "$has_mounted" == "false" ]] && \
-        printf '%b  \uf05a  No mounted partitions%b\n' "${GRAY}" "${RESET}" >&2
+    if [[ -z "$dev_entry" ]]; then
+        move "$dr" "$_DS_DETAIL_C"
+        printf "%b  No USB drives detected.%b" "$DK" "$RST"
+        move $(( dr+1 )) "$_DS_DETAIL_C"
+        printf "%b  Plug in a drive and press %br%b to rescan.%b" "$DK" "$LC" "$DK" "$RST"
+        return
+    fi
+
+    local dev size model tran hotplug
+    IFS=: read -r dev size model tran hotplug <<< "$dev_entry"
+    local bytes; bytes=$(get_device_bytes "$dev")
+    local serial vendor
+    serial=$(lsblk -nd -o SERIAL "$dev" 2>/dev/null | tr -d ' \n' || echo "—")
+    vendor=$(lsblk -nd -o VENDOR "$dev" 2>/dev/null | tr -d ' \n'  || echo "—")
+    [[ -z "$serial" ]] && serial="—"
+    [[ -z "$vendor" ]] && vendor="—"
+
+    move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+    printf "%b%b  Device Details%b" "$C" "$BO" "$RST"
+    move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+    printf "%b  ─────────────────────────────────────%b" "$DK" "$RST"
+
+    local _kv_items=("Path:$dev" "Size:$size  ($(fmt_bytes "$bytes"))" "Model:$model" "Vendor:$vendor" "Serial:$serial" "Bus:$tran")
+    local _kv_item _kv_key _kv_val
+    for _kv_item in "${_kv_items[@]}"; do
+        _kv_key="${_kv_item%%:*}"
+        _kv_val="${_kv_item#*:}"
+        move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+        printf "  %b%-10s%b  %b%s%b" "$DK" "$_kv_key" "$RST" "$LW" "$_kv_val" "$RST"
+    done
+
+    move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+    printf "%b  ─────────────────────────────────────%b" "$DK" "$RST"
+    move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+    printf "%b  Partitions%b" "$C" "$RST"
+
+    local pline
+    while IFS= read -r pline; do
+        move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+        printf "  %b%s%b" "$DK" "$pline" "$RST"
+        (( dr > _DS_PANEL_R + _DS_PANEL_H - 3 )) && break
+    done < <(lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT "$dev" 2>/dev/null | tail -n +2)
+
+    if [[ "$hotplug" != "1" && "$tran" != "usb" ]]; then
+        move "$dr" "$_DS_DETAIL_C"; (( dr++ ))
+        printf "%b%b  ⚠  Not a removable drive!%b" "$Y" "$BO" "$RST"
+        move "$dr" "$_DS_DETAIL_C"
+        printf "%b  Proceed with extreme caution.%b" "$Y" "$RST"
+    fi
 }
 
-pre_nuke_verification() {
-    local device="$1"
-    local size model vendor
-    size=$(lsblk  -nd -o SIZE   "$device" 2>/dev/null || echo "Unknown")
-    model=$(lsblk -nd -o MODEL  "$device" 2>/dev/null | sed 's/[[:space:]]*$//' || echo "Unknown")
-    vendor=$(lsblk -nd -o VENDOR "$device" 2>/dev/null | sed 's/[[:space:]]*$//' || echo "Unknown")
-
-    printf '\n%b  ╔══ PRE-NUKE VERIFICATION REPORT ══════════════════════╗%b\n' "${RED}${BOLD}" "${RESET}" >&2
-    printf '%b  ║  \uf7c8  Device: %-45s║%b\n' "${CYAN}" "$device" "${RESET}" >&2
-    printf '%b  ║  \uf493  Size:   %-45s║%b\n' "${CYAN}" "$size" "${RESET}" >&2
-    printf '%b  ║  \uf02b  Model:  %-45s║%b\n' "${CYAN}" "$vendor $model" "${RESET}" >&2
-    printf '%b  ╚════════════════════════════════════════════════════════╝%b\n\n' "${RED}${BOLD}" "${RESET}" >&2
-
-    printf '%b  Partition Layout:%b\n' "${CYAN}${BOLD}" "${RESET}" >&2
-    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT "$device" 2>/dev/null | sed 's/^/    /' >&2
-    echo "" >&2
-
-    local info total_bytes mounted_bytes unmounted_count
-    info=$(calc_destruction_data "$device")
-    total_bytes=$(echo   "$info" | cut -d: -f1)
-    mounted_bytes=$(echo "$info" | cut -d: -f2)
-    unmounted_count=$(echo "$info" | cut -d: -f3)
-
-    printf '%b  Mounted Contents:%b\n' "${CYAN}${BOLD}" "${RESET}" >&2
-    list_mounted_contents "$device"
-
-    printf '%b  \uf071  Data Destruction Summary:%b\n' "${YELLOW}${BOLD}" "${RESET}" >&2
-    printf '    Total to overwrite : %s (%s bytes)\n' "$(format_bytes "$total_bytes")" "$total_bytes" >&2
-    printf '    Mounted data lost  : %s (%s bytes)\n' "$(format_bytes "$mounted_bytes")" "$mounted_bytes" >&2
-    (( unmounted_count > 0 )) && \
-        warn "  $unmounted_count unmounted partition(s) — actual data loss may be higher"
-
-    printf '\n%b  \uf057  THIS ACTION IS COMPLETELY IRREVERSIBLE!%b\n'    "${RED}${BOLD}" "${RESET}" >&2
-    printf '%b  ALL DATA ON THIS DEVICE WILL BE PERMANENTLY DESTROYED!%b\n\n' "${RED}${BOLD}" "${RESET}" >&2
+_ds_draw_list_hint() {
+    local hint_r=$(( _DS_PANEL_R + _DS_PANEL_H - 2 ))
+    move "$hint_r" $(( _DS_PANEL_C + 1 ))
+    printf "%b  ↑↓ navigate   Enter select   r rescan   q quit%b" "$DK" "$RST"
+    printf '%*s' $(( _DS_LIST_W - 46 )) ''
 }
 
-validate_device() {
-    local device="$1"
-    start_timer "Device Validation"
+screen_device_select() {
+    scan_devices
 
-    [[ ! -b "$device" ]] && error_exit "Device '$device' does not exist or is not a block device."
+    draw_chrome
+    get_term_size
 
-    local is_removable transport
-    is_removable=$(lsblk -d -n -o HOTPLUG "$device" 2>/dev/null || echo "0")
-    transport=$(lsblk    -d -n -o TRAN    "$device" 2>/dev/null || echo "")
+    _DS_PANEL_H=$(( TH - 6 ))
+    local panel_w=$(( TW - 4 ))
+    _DS_PANEL_R=3
+    _DS_PANEL_C=3
 
-    if [[ "$is_removable" != "1" && "$transport" != "usb" ]]; then
-        case "$device" in
-            /dev/sda|/dev/nvme0n1|/dev/mmcblk0|/dev/vda|/dev/hda)
-                error_exit "\uf071 BLOCKED: '$device' appears to be a system disk (not removable).\nIf it really is your target USB, edit the protection list in the script." ;;
+    draw_box "$_DS_PANEL_R" "$_DS_PANEL_C" "$_DS_PANEL_H" "$panel_w" "$C" "Select Target Device"
+
+    _DS_LIST_W=$(( panel_w * 40 / 100 ))
+    _DS_DETAIL_C=$(( _DS_PANEL_C + _DS_LIST_W + 1 ))
+    _DS_DETAIL_W=$(( panel_w - _DS_LIST_W - 3 ))
+    _DS_INNER_H=$(( _DS_PANEL_H - 2 ))
+    _DS_INNER_R=$(( _DS_PANEL_R + 1 ))
+
+    local i
+    for (( i=0; i<_DS_INNER_H; i++ )); do
+        move $(( _DS_INNER_R + i )) $(( _DS_PANEL_C + _DS_LIST_W ))
+        printf "%b│%b" "$DK" "$RST"
+    done
+
+    local hdr_r=$_DS_INNER_R
+    move "$hdr_r" $(( _DS_PANEL_C + 1 ))
+    printf "%b%b %-6s %-10s %-18s %-6s%b" "$BO" "$LC" "DEV" "SIZE" "MODEL" "TRAN" "$RST"
+    (( hdr_r++ ))
+    move "$hdr_r" $(( _DS_PANEL_C + 1 ))
+    printf "%b" "$DK"; repeat_char '─' $(( _DS_LIST_W - 1 )); printf "%b" "$RST"
+    (( hdr_r++ ))
+
+    _DS_LIST_START=$hdr_r
+    _DS_INNER_R=$hdr_r   
+    if [[ ${#USB_DEVICES[@]} -eq 0 ]]; then
+        move "$hdr_r" $(( _DS_PANEL_C + 2 ))
+        printf "%b%b No USB drives found. %b" "$Y" "$BO" "$RST"
+        move $(( hdr_r + 1 )) $(( _DS_PANEL_C + 2 ))
+        printf "%b Connect a drive and press %br%b to rescan.%b" "$DK" "$LC" "$DK" "$RST"
+    fi
+
+    _DS_SELECTED=0
+    _ds_draw_device_list
+    _ds_draw_device_detail
+    _ds_draw_list_hint
+
+    while true; do
+        local key seq
+        IFS= read -rsn1 key
+
+        case "$key" in
+            $'\x1b')
+                IFS= read -rsn2 -t 0.1 seq || seq=""
+                case "$seq" in
+                    '[A')
+                        (( _DS_SELECTED > 0 )) && (( _DS_SELECTED-- ))
+                        _ds_draw_device_list; _ds_draw_device_detail ;;
+                    '[B')
+                        (( _DS_SELECTED < ${#USB_DEVICES[@]} - 1 )) && (( _DS_SELECTED++ ))
+                        _ds_draw_device_list; _ds_draw_device_detail ;;
+                esac ;;
+            '')
+                if [[ ${#USB_DEVICES[@]} -gt 0 ]]; then
+                    IFS=: read -r SEL_DEVICE _ <<< "${USB_DEVICES[$_DS_SELECTED]}"
+                    return 0
+                fi ;;
+            r|R)
+                scan_devices
+                _DS_SELECTED=0
+                _ds_draw_device_list; _ds_draw_device_detail ;;
+            q|Q|$'\x03')
+                tui_quit ;;
         esac
-        warn "Device '$device' may not be removable — triple-check before continuing!"
-    fi
+    done
+}
 
-    if sudo swapon --show 2>/dev/null | grep -q "$device"; then
-        error_exit "Device '$device' is used as swap. Disable first: sudo swapoff $device"
-    fi
+ Option arrays — set once in screen_configure, read by helpers
+declare -a CFG_WIPE_OPTS=()
+declare -a CFG_PTABLE_OPTS=()
+declare -a CFG_FS_OPTS=()
+declare -a CFG_SECTION_ROWS=(0 0 0 0)
+declare -a CFG_SECTION_HEIGHTS=(0 0 0 0)
+declare -a CFG_SECTION_ITEM_COUNTS=(0 0 0 0)
 
-    local mounted_parts
-    mounted_parts=$(mount | grep "^$device" | awk '{print $1}' || true)
-    if [[ -n "$mounted_parts" ]]; then
-        warn "Device '$device' has mounted partitions:"
-        mount | grep "^$device" | sed 's/^/  /' >&2
-        echo "" >&2
-        read -rp "  Unmount all and continue? (y/N): " cont
-        [[ ! "$cont" =~ ^[Yy]$ ]] && error_exit "Aborted by user."
+_cfg_draw_section() {
+    local sec=$1
+    local active=$(( sec == CFG_CUR_SECTION ? 1 : 0 ))
+    local row=${CFG_SECTION_ROWS[$sec]}
+    local bcolor; [[ $active -eq 1 ]] && bcolor="$C" || bcolor="$DK"
+    local titles=("Wipe Method" "Partition Table" "Filesystem" "Options")
+    local title="${titles[$sec]}"
+    local bh=${CFG_SECTION_HEIGHTS[$sec]}
+    local lw=$CFG_LEFT_W
+    local pc=$CFG_PANEL_C
 
-        info "Unmounting all partitions on $device..."
-        while IFS= read -r part; do
-            [[ -z "$part" ]] && continue
-            spinner_start "Unmounting $part"
-            if sudo umount "$part" 2>/dev/null; then
-                spinner_stop 0
+    draw_box "$row" "$pc" "$bh" "$lw" "$bcolor" "$title"
+
+    local ir=$(( row + 1 ))
+    local idx val label note time dot
+
+    case $sec in
+    0)
+        for (( idx=0; idx<${#CFG_WIPE_OPTS[@]}; idx++ )); do
+            IFS=: read -r val label time <<< "${CFG_WIPE_OPTS[$idx]}"
+            move "$ir" $(( pc + 2 ))
+            local dot; [[ $val -eq $SEL_WIPE ]] && dot="${LC}●${RST}" || dot="${DK}○${RST}"
+            if [[ $active -eq 1 && $idx -eq $CFG_CUR_ITEM ]]; then
+                printf "\033[7m\033[1m %-36s %-9s\033[m\033[K" \
+                    "$(printf '%s %s' "• $label")" "$time"
             else
-                spinner_stop 1
-                warn "Normal umount failed for $part — trying lazy unmount..."
-                sudo umount -l "$part" 2>/dev/null \
-                    && warn "Lazy unmount applied to $part (may still be in use)" \
-                    || warn "Could not unmount $part — it may cause issues later"
+                printf " %b %-30s%b%s%b\033[K" "$dot" "$label" "$DK" "$time" "$RST"
             fi
-        done <<< "$mounted_parts"
-        sync; sleep 2
-    fi
-
-    local size model vendor serial
-    size=$(lsblk   -nd -o SIZE   "$device" 2>/dev/null || echo "?")
-    model=$(lsblk  -nd -o MODEL  "$device" 2>/dev/null || echo "Unknown")
-    vendor=$(lsblk -nd -o VENDOR "$device" 2>/dev/null || echo "Unknown")
-    serial=$(lsblk -nd -o SERIAL "$device" 2>/dev/null || echo "Unknown")
-
-    printf '\n%b  ┌─ Target Device ───────────────────────────────────┐%b\n' "${CYAN}" "${RESET}" >&2
-    printf '%b  │  \uf7c8  Path   : %-40s │%b\n' "${RESET}" "$device"  "${RESET}" >&2
-    printf '%b  │  \uf493  Size   : %-40s │%b\n' "${RESET}" "$size"    "${RESET}" >&2
-    printf '%b  │  \uf02b  Vendor : %-40s │%b\n' "${RESET}" "$vendor"  "${RESET}" >&2
-    printf '%b  │  \uf02b  Model  : %-40s │%b\n' "${RESET}" "$model"   "${RESET}" >&2
-    printf '%b  │  \uf084  Serial : %-40s │%b\n' "${RESET}" "$serial"  "${RESET}" >&2
-    printf '%b  └───────────────────────────────────────────────────┘%b\n\n' "${CYAN}" "${RESET}" >&2
-
-    end_timer "Device Validation"
+            (( ir++ ))
+        done ;;
+    1)
+        for (( idx=0; idx<${#CFG_PTABLE_OPTS[@]}; idx++ )); do
+            IFS=: read -r val label note <<< "${CFG_PTABLE_OPTS[$idx]}"
+            move "$ir" $(( pc + 2 ))
+            local dot; [[ $val -eq $SEL_PTABLE ]] && dot="${LC}●${RST}" || dot="${DK}○${RST}"
+            if [[ $active -eq 1 && $idx -eq $CFG_CUR_ITEM ]]; then
+                printf "\033[7m\033[1m %-36s %-9s\033[m\033[K" \
+                    "$(printf '%s %s' "• $label")" "$note"
+            else
+                printf " %b %-28s%b%s%b\033[K" "$dot" "$label" "$DK" "$note" "$RST"
+            fi
+            (( ir++ ))
+        done ;;
+    2)
+        for (( idx=0; idx<${#CFG_FS_OPTS[@]}; idx++ )); do
+            IFS=: read -r val label note <<< "${CFG_FS_OPTS[$idx]}"
+            move "$ir" $(( pc + 2 ))
+            local dot; [[ $val -eq $SEL_FS ]] && dot="${LC}●${RST}" || dot="${DK}○${RST}"
+            if [[ $active -eq 1 && $idx -eq $CFG_CUR_ITEM ]]; then
+                printf "\033[7m\033[1m %-36s %-14s\033[m\033[K" \
+                    "$(printf '%s %s' "• $label")" "$note"
+            else
+                printf " %b %-28s%b%s%b\033[K" "$dot" "$label" "$DK" "$note" "$RST"
+            fi
+            (( ir++ ))
+        done ;;
+    3)
+        move "$ir" $(( pc + 2 ))
+        if [[ $active -eq 1 && $CFG_CUR_ITEM -eq 0 ]]; then
+            printf "\033[7m\033[1m %-50s\033[m\033[K" "  Label: $SEL_LABEL   (press l to edit)"
+        else
+            printf " %bLabel:%b  %b%s%b   %b(press l to edit)%b\033[K" \
+                "$DK" "$RST" "$LW" "$SEL_LABEL" "$RST" "$DK" "$RST"
+        fi
+        (( ir++ ))
+        move "$ir" $(( pc + 2 ))
+        local enc_mark; [[ $SEL_ENCRYPT -eq 1 ]] && enc_mark="[✓]" || enc_mark="[ ]"
+        if [[ $active -eq 1 && $CFG_CUR_ITEM -eq 1 ]]; then
+            printf "\033[7m\033[1m %-50s\033[m\033[K" " $enc_mark Encrypt with LUKS2   (Tab to toggle)"
+        else
+            local em_col; [[ $SEL_ENCRYPT -eq 1 ]] && em_col="$LG" || em_col="$DK"
+            printf " %b%s%b %bEncrypt with LUKS2%b   %b(Tab to toggle)%b\033[K" \
+                "$em_col" "$enc_mark" "$RST" "$DK" "$RST" "$DK" "$RST"
+        fi
+        (( ir++ ))
+        move "$ir" $(( pc + 2 ))
+        local mnt_mark; [[ $SEL_MOUNT -eq 1 ]] && mnt_mark="[✓]" || mnt_mark="[ ]"
+        if [[ $active -eq 1 && $CFG_CUR_ITEM -eq 2 ]]; then
+            printf "\033[7m\033[1m %-50s\033[m\033[K" " $mnt_mark Mount after completion  (Tab to toggle)"
+        else
+            local mm_col; [[ $SEL_MOUNT -eq 1 ]] && mm_col="$LG" || mm_col="$DK"
+            printf " %b%s%b %bMount after completion%b  %b(Tab to toggle)%b\033[K" \
+                "$mm_col" "$mnt_mark" "$RST" "$DK" "$RST" "$DK" "$RST"
+        fi
+        (( ir++ ))
+        if [[ $SEL_MOUNT -eq 1 ]]; then
+            move "$ir" $(( pc + 2 ))
+            printf "   %bMount name:%b  %b/mnt/%s%b  %b(press m to edit)%b\033[K" \
+                "$DK" "$RST" "$LW" "$SEL_MOUNTNAME" "$RST" "$DK" "$RST"
+        else
+            move "$ir" $(( pc + 2 )); printf "\033[K"
+        fi ;;
+    esac
 }
 
+_cfg_draw_right_panel() {
+    local row=$CFG_PANEL_R
+    local rc=$CFG_RIGHT_C
+    local rw=$(( CFG_RIGHT_W - 1 ))
+    local i
 
-read_with_timeout() {
-    local prompt="$1" timeout="${2:-30}" default="${3:-}" response
-    [[ -n "$default" ]] && prompt="$prompt [default: $default]: " || prompt="$prompt: "
-    if read -t "$timeout" -rp "$prompt" response; then
-        echo "${response:-$default}"
+    
+    for (( i=3; i<=TH-2; i++ )); do
+        move "$i" "$rc"
+        printf '%*s' "$rw" ''
+    done
+    row=3
+
+    move "$row" "$rc"; (( row++ ))
+    printf "%b%b  Configuration Summary%b" "$C" "$BO" "$RST"
+    move "$row" "$rc"; (( row++ ))
+    printf "%b  ─────────────────────────────────%b" "$DK" "$RST"
+
+    local wipe_names=("None (quick format)" "Zero fill" "Random" "Shred 3-pass" "DoD 7-pass")
+    local pt_names=("" "GPT" "MBR")
+    local fs_names=("" "ext4" "exFAT" "FAT32" "NTFS")
+
+    move "$row" "$rc"; (( row++ ))
+    printf "  %b%-14s%b  %b%s%b" "$DK" "Device"     "$RST" "$LW" "$SEL_DEVICE  ($CFG_DEV_SIZE)"  "$RST"
+    move "$row" "$rc"; (( row++ ))
+    printf "  %b%-14s%b  %b%s%b" "$DK" "Wipe"       "$RST" "$LW" "${wipe_names[$SEL_WIPE]}"       "$RST"
+    move "$row" "$rc"; (( row++ ))
+    printf "  %b%-14s%b  %b%s%b" "$DK" "Partition"  "$RST" "$LW" "${pt_names[$SEL_PTABLE]}"       "$RST"
+    move "$row" "$rc"; (( row++ ))
+    printf "  %b%-14s%b  %b%s%b" "$DK" "Filesystem" "$RST" "$LW" "${fs_names[$SEL_FS]}  (label: $SEL_LABEL)" "$RST"
+
+    local enc_s mnt_s
+    [[ $SEL_ENCRYPT -eq 1 ]] && enc_s="${LG}Yes — LUKS2${RST}" || enc_s="${DK}No${RST}"
+    move "$row" "$rc"; (( row++ ))
+    printf "  %b%-14s%b  " "$DK" "Encrypt" "$RST"; printf "%b" "$enc_s"
+
+    [[ $SEL_MOUNT -eq 1 ]] && mnt_s="${LG}/mnt/$SEL_MOUNTNAME${RST}" || mnt_s="${DK}No${RST}"
+    move "$row" "$rc"; (( row++ ))
+    printf "  %b%-14s%b  " "$DK" "Mount" "$RST"; printf "%b" "$mnt_s"
+
+    (( row++ ))
+    move "$row" "$rc"; (( row++ ))
+    printf "%b  ─────────────────────────────────%b" "$DK" "$RST"
+
+    local est_spd=$(( 100 * 1048576 ))
+    local wipe_mult=(0 1 1 3 7)
+    local mult=${wipe_mult[$SEL_WIPE]}
+    move "$row" "$rc"; (( row++ ))
+    if (( mult == 0 )); then
+        printf "  %bEstimated time:%b  %b< 1 minute%b" "$LG" "$RST" "$LW" "$RST"
     else
-        warn "Input timeout — using default: ${default:-none}"
-        echo "$default"
+        local est_t; est_t=$(fmt_dur $(( CFG_DEV_BYTES * mult / est_spd + 1 )))
+        printf "  %bEstimated time:%b  %b~%s%b  %b(wipe)%b" "$Y" "$RST" "$LW" "$est_t" "$RST" "$DK" "$RST"
+    fi
+
+    (( row += 2 ))
+    draw_box "$row" "$rc" 5 $(( CFG_RIGHT_W - 1 )) "$Y"
+    move $(( row + 1 )) $(( rc + 2 ))
+    printf "%b%b ⚠  ALL DATA WILL BE LOST%b" "$Y" "$BO" "$RST"
+    move $(( row + 2 )) $(( rc + 2 ))
+    printf "%b  Review your choices carefully.%b" "$DK" "$RST"
+    move $(( row + 3 )) $(( rc + 2 ))
+    printf "%b  This cannot be undone.%b" "$DK" "$RST"
+
+    local hint_r=$(( TH - 2 ))
+    move "$hint_r" "$rc"
+    printf "%b  F10 / Enter on last section:%b" "$DK" "$RST"
+    move $(( hint_r + 1 )) "$rc"
+    printf "%b  Proceed to confirmation →%b" "$LC" "$RST"
+}
+
+_cfg_redraw_all() {
+    local s
+    for (( s=0; s<4; s++ )); do _cfg_draw_section "$s"; done
+    _cfg_draw_right_panel
+}
+
+
+screen_configure() {
+    draw_chrome
+    get_term_size
+
+    CFG_PANEL_W=$(( TW - 4 ))
+    CFG_PANEL_R=4
+    CFG_PANEL_C=3
+    CFG_LEFT_W=$(( CFG_PANEL_W * 55 / 100 ))
+    CFG_RIGHT_C=$(( CFG_PANEL_C + CFG_LEFT_W + 2 ))
+    CFG_RIGHT_W=$(( CFG_PANEL_W - CFG_LEFT_W - 3 ))
+
+    CFG_DEV_BYTES=$(get_device_bytes "$SEL_DEVICE")
+    CFG_DEV_SIZE=$(lsblk -nd -o SIZE "$SEL_DEVICE" 2>/dev/null | tr -d ' \n' || echo "?")
+    CFG_DEV_MODEL=$(lsblk -nd -o MODEL "$SEL_DEVICE" 2>/dev/null | tr -d ' \n' || echo "Unknown")
+    [[ -z "$CFG_DEV_SIZE" ]] && CFG_DEV_SIZE="?"
+
+    local est_spd=$(( 100 * 1048576 ))
+
+    
+    move "$CFG_PANEL_R" "$CFG_PANEL_C"
+    printf "%b%b%b" "$BG_DK" "$LC" "$BO"
+    printf ' %-*s ' $(( CFG_PANEL_W - 2 )) \
+        "  Device: $SEL_DEVICE   $CFG_DEV_SIZE   $CFG_DEV_MODEL"
+    printf "%b" "$RST"
+    (( CFG_PANEL_R++ ))
+
+    
+    CFG_WIPE_OPTS=(
+        "0:Quick format (no wipe):instant"
+        "1:Zero fill (single pass):~$(fmt_dur $(( CFG_DEV_BYTES / est_spd + 1 )))"
+        "2:Random data (single pass):~$(fmt_dur $(( CFG_DEV_BYTES / est_spd + 1 )))"
+        "3:Shred 3-pass:~$(fmt_dur $(( CFG_DEV_BYTES * 3 / est_spd + 1 )))"
+        "4:DoD 7-pass:~$(fmt_dur $(( CFG_DEV_BYTES * 7 / est_spd + 1 )))"
+    )
+    CFG_PTABLE_OPTS=(
+        "1:GPT — modern, recommended:>2TB, UEFI"
+        "2:MBR — legacy compatible:BIOS, <2TB"
+    )
+    CFG_FS_OPTS=(
+        "1:ext4 — Linux native, journaled:Linux only"
+        "2:exFAT — cross-platform, large files:Win/Mac/Linux, >4GB files"
+        "3:FAT32 — universal, max 4GB/file:All systems"
+        "4:NTFS — Windows native:Win primary, Linux read/write"
+    )
+
+    CFG_SECTION_ITEM_COUNTS=(${#CFG_WIPE_OPTS[@]} ${#CFG_PTABLE_OPTS[@]} ${#CFG_FS_OPTS[@]} 3)
+    CFG_SECTION_HEIGHTS=(
+        $(( ${#CFG_WIPE_OPTS[@]}   + 3 ))
+        $(( ${#CFG_PTABLE_OPTS[@]} + 3 ))
+        $(( ${#CFG_FS_OPTS[@]}     + 3 ))
+        6
+    )
+
+    CFG_SECTION_ROWS[0]=$(( CFG_PANEL_R + 1 ))
+    CFG_SECTION_ROWS[1]=$(( CFG_SECTION_ROWS[0] + CFG_SECTION_HEIGHTS[0] + 1 ))
+    CFG_SECTION_ROWS[2]=$(( CFG_SECTION_ROWS[1] + CFG_SECTION_HEIGHTS[1] + 1 ))
+    CFG_SECTION_ROWS[3]=$(( CFG_SECTION_ROWS[2] + CFG_SECTION_HEIGHTS[2] + 1 ))
+
+    CFG_CUR_SECTION=0
+    CFG_CUR_ITEM=0
+
+    _cfg_redraw_all
+
+    while true; do
+        local key seq
+        IFS= read -rsn1 key
+
+        case "$key" in
+            $'\x1b')
+                IFS= read -rsn2 -t 0.1 seq || seq=""
+                case "$seq" in
+                    '[A')   # Up
+                        if (( CFG_CUR_ITEM > 0 )); then
+                            (( CFG_CUR_ITEM-- ))
+                        else
+                            if (( CFG_CUR_SECTION > 0 )); then
+                                (( CFG_CUR_SECTION-- ))
+                                CFG_CUR_ITEM=$(( CFG_SECTION_ITEM_COUNTS[CFG_CUR_SECTION] - 1 ))
+                            fi
+                        fi
+                        _cfg_redraw_all ;;
+                    '[B')   # Down
+                        if (( CFG_CUR_ITEM < CFG_SECTION_ITEM_COUNTS[CFG_CUR_SECTION] - 1 )); then
+                            (( CFG_CUR_ITEM++ ))
+                        else
+                            if (( CFG_CUR_SECTION < 3 )); then
+                                (( CFG_CUR_SECTION++ ))
+                                CFG_CUR_ITEM=0
+                            fi
+                        fi
+                        _cfg_redraw_all ;;
+                    '[Z')   
+                        (( CFG_CUR_SECTION > 0 )) && (( CFG_CUR_SECTION-- ))
+                        CFG_CUR_ITEM=0
+                        _cfg_redraw_all ;;
+                esac ;;
+            '')     
+                case $CFG_CUR_SECTION in
+                    0) IFS=: read -r SEL_WIPE   _ <<< "${CFG_WIPE_OPTS[$CFG_CUR_ITEM]}" ;;
+                    1) IFS=: read -r SEL_PTABLE _ <<< "${CFG_PTABLE_OPTS[$CFG_CUR_ITEM]}" ;;
+                    2) IFS=: read -r SEL_FS     _ <<< "${CFG_FS_OPTS[$CFG_CUR_ITEM]}" ;;
+                    3) return 0 ;;
+                esac
+                if (( CFG_CUR_SECTION < 3 )); then
+                    (( CFG_CUR_SECTION++ ))
+                    CFG_CUR_ITEM=0
+                fi
+                _cfg_redraw_all ;;
+            $'\t')  
+                if (( CFG_CUR_SECTION == 3 )); then
+                    case $CFG_CUR_ITEM in
+                        1) SEL_ENCRYPT=$(( 1 - SEL_ENCRYPT )) ;;
+                        2) SEL_MOUNT=$(( 1 - SEL_MOUNT )) ;;
+                    esac
+                else
+                    (( CFG_CUR_SECTION < 3 )) && (( CFG_CUR_SECTION++ ))
+                    CFG_CUR_ITEM=0
+                fi
+                _cfg_redraw_all ;;
+            l|L)
+                if (( CFG_CUR_SECTION == 3 )); then
+                    local opt_row=$(( CFG_SECTION_ROWS[3] + 1 ))
+                    move "$opt_row" $(( CFG_PANEL_C + 11 ))
+                    printf "%b%b                    %b" "$BG_DK" "$LW" "$RST"
+                    move "$opt_row" $(( CFG_PANEL_C + 11 ))
+                    printf "%b%b%b" "$SHOW" "$BG_DK" "$LW"
+                    local newlabel
+                    IFS= read -r newlabel
+                    printf "%b%b" "$HIDE" "$RST"
+                    [[ -n "$newlabel" ]] && SEL_LABEL="${newlabel:0:15}"
+                    _cfg_redraw_all
+                fi ;;
+            m|M)
+                if (( CFG_CUR_SECTION == 3 && SEL_MOUNT == 1 )); then
+                    local opt_row=$(( CFG_SECTION_ROWS[3] + 3 ))
+                    move "$opt_row" $(( CFG_PANEL_C + 20 ))
+                    printf "%b%b              %b" "$BG_DK" "$LW" "$RST"
+                    move "$opt_row" $(( CFG_PANEL_C + 20 ))
+                    printf "%b%b%b" "$SHOW" "$BG_DK" "$LW"
+                    local newmnt
+                    IFS= read -r newmnt
+                    printf "%b%b" "$HIDE" "$RST"
+                    [[ -n "$newmnt" ]] && SEL_MOUNTNAME="${newmnt//[^a-zA-Z0-9_-]/}"
+                    _cfg_redraw_all
+                fi ;;
+            q|Q|$'\x1b')
+                screen_device_select; return ;;
+        esac
+    done
+}
+
+
+screen_confirm() {
+    draw_chrome
+    get_term_size
+
+    local cw=$(( TW - 10 ))
+    local cr=$(( (TH - 24) / 2 ))
+    (( cr < 3 )) && cr=3
+    local cc=5
+
+    draw_box "$cr" "$cc" 22 "$cw" "$R" "⚠  POINT OF NO RETURN"
+
+    local r=$(( cr + 2 ))
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "%b%b  ALL DATA ON THE FOLLOWING DEVICE WILL BE PERMANENTLY ERASED:%b" "$LR" "$BO" "$RST"
+    (( r++ ))
+
+    local dev_bytes; dev_bytes=$(get_device_bytes "$SEL_DEVICE")
+    local dev_size; dev_size=$(lsblk -nd -o SIZE "$SEL_DEVICE" 2>/dev/null | tr -d ' \n' || echo "?")
+    local dev_model; dev_model=$(lsblk -nd -o MODEL "$SEL_DEVICE" 2>/dev/null | tr -d ' \n' || echo "")
+
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "%b%b%b  %-*s  %b" "$BG_RED" "$LW" "$BO" $(( cw - 12 )) \
+        "  $SEL_DEVICE   $dev_size   $dev_model" "$RST"
+
+    (( r++ ))
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "%b  Operation plan:%b" "$Y" "$RST"
+
+    local wipe_names=("None (quick format)" "Zero fill — single pass" "Random data — single pass" "Shred — 3 passes" "DoD 5220.22-M — 7 passes")
+    local ptable_names=("" "GPT" "MBR")
+    local fs_names=("" "ext4" "exFAT" "FAT32" "NTFS")
+
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "  %bWipe      :%b  %b%s%b" "$DK" "$RST" "$LW" "${wipe_names[$SEL_WIPE]}" "$RST"
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "  %bPartition :%b  %b%s%b" "$DK" "$RST" "$LW" "${ptable_names[$SEL_PTABLE]}" "$RST"
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "  %bFilesystem:%b  %b%s  (label: %s)%b" "$DK" "$RST" "$LW" "${fs_names[$SEL_FS]}" "$SEL_LABEL" "$RST"
+
+    if [[ $SEL_ENCRYPT -eq 1 ]]; then
+        move "$r" $(( cc + 4 )); (( r++ ))
+        printf "  %bEncryption:%b  %bLUKS2 (AES-XTS-512 + argon2id)%b" "$DK" "$RST" "$LG" "$RST"
+    fi
+
+    (( r++ ))
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "%b  ────────────────────────────────────────────────────────────%b" "$DK" "$RST"
+
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "%b%b  Step 1 of 2:%b  Type the exact device path to confirm:" "$Y" "$BO" "$RST"
+    move "$r" $(( cc + 4 ))
+    printf "%b  ›%b  " "$DK" "$RST"
+    printf "%b" "$SHOW"
+    local dev_confirm
+    IFS= read -r dev_confirm
+    printf "%b" "$HIDE"
+
+    if [[ "$dev_confirm" != "$SEL_DEVICE" ]]; then
+        (( r++ ))
+        move "$r" $(( cc + 4 )); (( r++ ))
+        printf "%b  ✗  Mismatch. Got '%s', expected '%s'. Aborted.%b" \
+            "$R" "$dev_confirm" "$SEL_DEVICE" "$RST"
+        move $(( r+1 )) $(( cc + 4 ))
+        printf "%b  Press any key to go back...%b" "$DK" "$RST"
+        read -rsn1
+        screen_configure; return
+    fi
+
+    (( r++ ))
+    move "$r" $(( cc + 4 )); (( r++ ))
+    printf "%b%b  Step 2 of 2:%b  Type %b%b NUKE IT %b to begin (case-sensitive):" \
+        "$LR" "$BO" "$RST" "$BG_RED" "$LW" "$RST"
+    move "$r" $(( cc + 4 ))
+    printf "%b  ›%b  " "$DK" "$RST"
+    printf "%b" "$SHOW"
+    local nuke_confirm
+    IFS= read -r nuke_confirm
+    printf "%b" "$HIDE"
+
+    if [[ "$nuke_confirm" != "NUKE IT" ]]; then
+        (( r++ ))
+        move "$r" $(( cc + 4 ))
+        printf "%b  ✗  Confirmation failed. Aborted.%b" "$R" "$RST"
+        move $(( r+2 )) $(( cc + 4 ))
+        printf "%b  Press any key to go back...%b" "$DK" "$RST"
+        read -rsn1
+        screen_configure; return
+    fi
+
+    CONFIRMED=1
+}
+
+
+_SPIN_PID=""
+
+spin_start() {
+    local row=$1 col=$2 label="${3:-}"
+    (
+        local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+        local i=0
+        while true; do
+            move "$row" "$col"
+            printf "%b%s%b %s   " "$C" "${frames[$((i % 10))]}" "$RST" "$label"
+            sleep 0.1
+            (( i++ ))
+        done
+    ) &
+    _SPIN_PID=$!
+}
+
+spin_stop() {
+    local row=$1 col=$2 label="${3:-}" ok="${4:-1}"
+    if [[ -n "$_SPIN_PID" ]]; then
+        kill -9 "$_SPIN_PID" 2>/dev/null
+        wait "$_SPIN_PID" 2>/dev/null || true
+        _SPIN_PID=""
+    fi
+    move "$row" "$col"
+    if [[ $ok -eq 1 ]]; then
+        printf "%b✓%b %-50s %bdone%b" "$LG" "$RST" "$label" "$DK" "$RST"
+    else
+        printf "%b✗%b %-50s %bFAILED%b" "$R" "$RST" "$label" "$R" "$RST"
     fi
 }
 
-validate_numeric_choice() {
-    local c="$1" min="$2" max="$3"
-    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= min && c <= max ))
+
+_draw_progress() {
+    local row=$1 col=$2 pct=$3 written=$4 total=$5 speed="${6:-}" eta="${7:-}"
+    local bw=$(( TW - col - 30 ))
+    (( bw < 10 )) && bw=10
+    local filled=$(( bw * pct / 100 ))
+    local empty=$(( bw - filled ))
+
+    move "$row" "$col"
+    printf "%b" "$C";  repeat_char '█' "$filled"
+    printf "%b" "$DK"; repeat_char '░' "$empty"
+    printf "%b %b%3d%%%b" "$RST" "$BO" "$pct" "$RST"
+
+    move $(( row + 1 )) "$col"
+    printf "%b%s / %s%b   %b%s%b   %bETA %s%b%*s" \
+        "$DK" "$(fmt_bytes "$written")" "$(fmt_bytes "$total")" "$RST" \
+        "$W"  "$speed" "$RST" \
+        "$DK" "$eta"   "$RST" 10 ''
 }
 
 
-_fmt_bytes_short() {
-    local b=$1
-    if   (( b >= 1073741824 )); then awk "BEGIN{printf \"%.1f GB\", $b/1073741824}"
-    elif (( b >= 1048576    )); then awk "BEGIN{printf \"%.1f MB\", $b/1048576}"
-    elif (( b >= 1024       )); then awk "BEGIN{printf \"%.1f KB\", $b/1024}"
-    else printf "%d B" "$b"
-    fi
-}
+run_dd_pass() {
+    local source=$1 dest=$2 label=$3 total_bytes=$4
+    local prog_row=$5 prog_col=$6
+    local progress_file; progress_file=$(mktemp /tmp/.nuke_dd.XXXXXX)
+    local start=$SECONDS
 
-_draw_bar() {
-    local pct=$1 width=38 filled empty bar=""
-    filled=$(( width * pct / 100 )); empty=$(( width - filled ))
-    local i; for (( i=0; i<filled; i++ )); do bar+="█"; done
-    for (( i=0; i<empty; i++ )); do bar+="░"; done
-    printf "%s" "$bar"
-}
-
-progress_bar_dd() {
-    local source="$1" dest="$2" total_bytes="$3" label="${4:-Writing...}"
-
-      local progress_file
-    progress_file=$(mktemp /tmp/dd_progress.XXXXXX)
-
-    printf "${HIDE_CURSOR}" >&2
-
-    sudo dd if="$source" of="$dest" bs=4M conv=fsync 2>"$progress_file" &
+    sudo dd if="$source" of="$dest" bs=4M 2>"$progress_file" &
     local dd_pid=$!
 
-    local start_sec=$SECONDS
-    local last_written=0
+    move "$prog_row" "$prog_col"
+    printf "%b%s%b" "$DK" "$label" "$RST"
 
     while kill -0 "$dd_pid" 2>/dev/null; do
         sudo kill -USR1 "$dd_pid" 2>/dev/null || true
         sleep 1
-
-        local last_line
-        last_line=$(grep -E "^[0-9]+ bytes" "$progress_file" 2>/dev/null | tail -n1 || true)
-
-        if [[ "$last_line" =~ ^([0-9]+)[[:space:]]bytes ]]; then
-            local written="${BASH_REMATCH[1]}"
-            local pct=0 speed="" eta_str=""
+        local line=""
+        line=$(grep -E "^[0-9]+ bytes" "$progress_file" 2>/dev/null | tail -1 || true)
+        if [[ "$line" =~ ^([0-9]+)[[:space:]]bytes ]]; then
+            local written="${BASH_REMATCH[1]}" pct=0 speed="" eta="—"
             (( total_bytes > 0 )) && pct=$(( written * 100 / total_bytes ))
             (( pct > 100 )) && pct=100
-
-            [[ "$last_line" =~ ([0-9.]+[[:space:]][KMGT]?B/s) ]] && speed="${BASH_REMATCH[1]}"
-
-            local elapsed=$(( SECONDS - start_sec ))
+            [[ "$line" =~ ([0-9.]+[[:space:]][KMGT]?B/s) ]] && speed="${BASH_REMATCH[1]}"
+            local elapsed=$(( SECONDS - start ))
             if (( elapsed > 0 && written > 0 && total_bytes > written )); then
                 local rate=$(( written / elapsed ))
-                if (( rate > 0 )); then
-                    local remaining=$(( (total_bytes - written) / rate ))
-                    eta_str=" ETA $(format_duration "$remaining")"
-                fi
+                (( rate > 0 )) && eta=$(fmt_dur $(( (total_bytes - written) / rate )))
             fi
-
-            local bar; bar=$(_draw_bar "$pct")
-            printf "\r  ${CYAN}%s${RESET} ${BOLD}%3d%%${RESET}  ${GRAY}%s / %s${RESET}  ${DIM}%s%s${RESET}   " \
-                "$bar" "$pct" \
-                "$(_fmt_bytes_short "$written")" \
-                "$(_fmt_bytes_short "$total_bytes")" \
-                "$speed" "$eta_str" >&2
-
-            last_written=$written
+            _draw_progress "$prog_row" "$prog_col" "$pct" "$written" "$total_bytes" "$speed" "$eta"
         fi
     done
 
-    wait "$dd_pid" 2>/dev/null
-    local rc=$?
-
-    local bar; bar=$(_draw_bar 100)
-    printf "\r  ${CYAN}%s${RESET} ${BOLD}%3d%%${RESET}  ${GRAY}%s / %s${RESET}   " \
-        "$bar" 100 \
-        "$(_fmt_bytes_short "$total_bytes")" \
-        "$(_fmt_bytes_short "$total_bytes")" >&2
-
+    wait "$dd_pid" 2>/dev/null; local rc=$?
     rm -f "$progress_file"
-    printf "\r${ERASE_LINE}" >&2
-    printf "${SHOW_CURSOR}" >&2
 
-    if [[ $rc -eq 0 || $rc -eq 1 ]]; then
-        local elapsed=$(( SECONDS - start_sec ))
-        local rate_str=""
-        (( elapsed > 0 )) && rate_str="  $(( total_bytes / elapsed / 1048576 )) MB/s avg"
-        printf "  ${GREEN}\uf058${RESET}  %-40s ${GRAY}%s%s${RESET}\n" \
-            "$label" "$(format_duration "$elapsed")" "$rate_str" >&2
-        return 0
-    else
-        printf "  ${RED}\uf057${RESET}  %s  ${RED}[dd exited %d]${RESET}\n" "$label" "$rc" >&2
-        warn "'No space left on device' from dd is NORMAL — the drive is full and the wipe completed"
-        return "$rc"
-    fi
+    local elapsed=$(( SECONDS - start )); (( elapsed < 1 )) && elapsed=1
+    local avg=$(( total_bytes / elapsed / 1048576 ))
+    _draw_progress "$prog_row" "$prog_col" 100 "$total_bytes" "$total_bytes" "${avg} MB/s" "done"
+    move $(( prog_row + 2 )) "$prog_col"
+
+    [[ $rc -eq 0 || $rc -eq 1 ]] && return 0 || return "$rc"
 }
 
-progress_shred() {
-    local device="$1" passes="$2" label="${3:-Shredding...}"
-    local total=$(( passes + 1 ))   # shred adds a final zero pass
 
-    printf "${HIDE_CURSOR}" >&2
-    info "$label  (${total} passes total)" >&2
-
-  
-    local progress_file
-    progress_file=$(mktemp /tmp/shred_progress.XXXXXX)
+run_shred_pass() {
+    local device=$1 passes=$2 prog_row=$3 prog_col=$4
+    local total=$(( passes + 1 ))
+    local progress_file; progress_file=$(mktemp /tmp/.nuke_shred.XXXXXX)
 
     sudo shred -v -n "$passes" -z "$device" 2>"$progress_file" &
     local shred_pid=$!
 
     while kill -0 "$shred_pid" 2>/dev/null; do
         sleep 1
-        local last_line
-        last_line=$(grep -E "pass [0-9]+/[0-9]+" "$progress_file" 2>/dev/null | tail -n1 || true)
-
-        if [[ "$last_line" =~ pass[[:space:]]([0-9]+)/([0-9]+) ]]; then
+        local line=""
+        line=$(grep -E "pass [0-9]+/[0-9]+" "$progress_file" 2>/dev/null | tail -1 || true)
+        if [[ "$line" =~ pass[[:space:]]([0-9]+)/([0-9]+) ]]; then
             local cur="${BASH_REMATCH[1]}" tot="${BASH_REMATCH[2]}" ptype="" in_pct=0
-            local _pre='[(]([^)]+)[)]'
-            [[ "$last_line" =~ $_pre ]] && ptype="${BASH_REMATCH[1]}"
-            [[ "$last_line" =~ \.\.\.([0-9]+)% ]] && in_pct="${BASH_REMATCH[1]}"
+            local _ptype_re='\(([^)]+)\)'
+            [[ "$line" =~ $_ptype_re ]] && ptype="${BASH_REMATCH[1]}"
+            [[ "$line" =~ \.\.\.([0-9]+)% ]] && in_pct="${BASH_REMATCH[1]}"
             local pct=$(( ( (cur-1)*100 + in_pct ) / tot ))
             (( pct > 100 )) && pct=100
-            local bar; bar=$(_draw_bar "$pct")
-            printf "\r  ${CYAN}%s${RESET} ${BOLD}%3d%%${RESET}  ${GRAY}Pass %d/%d${RESET}  ${DIM}(%s)${RESET}   " \
-                "$bar" "$pct" "$cur" "$tot" "$ptype" >&2
+
+            local bw=$(( TW - prog_col - 30 ))
+            (( bw < 10 )) && bw=10
+            local filled=$(( bw * pct / 100 ))
+            local empty=$(( bw - filled ))
+
+            move "$prog_row" "$prog_col"
+            printf "%b" "$M";  repeat_char '█' "$filled"
+            printf "%b" "$DK"; repeat_char '░' "$empty"
+            printf "%b %b%3d%%%b  %bpass %d/%d (%s)%b" \
+                "$RST" "$BO" "$pct" "$RST" "$DK" "$cur" "$tot" "$ptype" "$RST"
         fi
     done
 
-    wait "$shred_pid" 2>/dev/null
-    local rc=$?
+    wait "$shred_pid" 2>/dev/null; local rc=$?
     rm -f "$progress_file"
-
-    printf "\r${ERASE_LINE}" >&2
-    printf "${SHOW_CURSOR}" >&2
-
-    if [[ $rc -eq 0 ]]; then
-        printf "  ${GREEN}\uf058${RESET}  %s — %d passes complete\n" "$label" "$total" >&2
-    else
-        printf "  ${RED}\uf057${RESET}  %s failed (shred exit: %d)\n" "$label" "$rc" >&2
-        warn "Check that the device is still connected and not write-protected"
-    fi
+    move "$prog_row" "$prog_col"
+    printf "%b✓ Shred complete (%d passes)%b%*s" "$LG" "$total" "$RST" 20 ''
     return $rc
 }
 
 
-perform_wipe_with_progress() {
-    local device="$1" method="$2" passes="$3"
-    local device_bytes; device_bytes=$(get_device_bytes "$device")
+declare -a EXEC_STEPS=()
 
-    printf '%b\n  \uf06e  Wipe Configuration:%b\n' "${CYAN}${BOLD}" "${RESET}" >&2
-    printf '  Device : %s\n'  "$device" >&2
-    printf '  Method : %s\n'  "$method" >&2
-    printf '  Passes : %d\n'  "$passes" >&2
-    printf '  Total  : %s\n\n' "$(format_bytes $(( device_bytes * passes )))" >&2
-
-    local estimated_speed=$(( 50 * 1048576 ))
-    local est=$(( device_bytes * passes / estimated_speed ))
-    printf '  \uf017  Estimated time at ~50 MB/s: %s\n\n' "$(format_duration "$est")" >&2
-
-    local pass
-    for pass in $(seq 1 "$passes"); do
-        printf '%b  Pass %d of %d:%b\n' "${YELLOW}${BOLD}" "$pass" "$passes" "${RESET}" >&2
-        case "$method" in
-            zeros)
-                progress_bar_dd /dev/zero    "$device" "$device_bytes" "Zero-fill pass $pass/$passes" \
-                    || warn "Pass $pass hit end of device — this is normal (device is full)"
-                ;;
-            random)
-                progress_bar_dd /dev/urandom "$device" "$device_bytes" "Random pass $pass/$passes" \
-                    || warn "Pass $pass hit end of device — this is normal"
-                ;;
-            pattern)
-                case $pass in
-                    1) progress_bar_dd /dev/zero    "$device" "$device_bytes" "0x00 pass $pass/$passes" \
-                           || warn "Pass $pass: end of device (normal)" ;;
-                    2) progress_bar_dd /dev/urandom "$device" "$device_bytes" "Random pass $pass/$passes" \
-                           || warn "Pass $pass: end of device (normal)" ;;
-                    *) progress_bar_dd /dev/urandom "$device" "$device_bytes" "Random pass $pass/$passes" \
-                           || warn "Pass $pass: end of device (normal)" ;;
-                esac
-                ;;
-        esac
-        sync
-        success "Pass $pass complete"
-    done
-}
-
-perform_shred_wipe() {
-    local device="$1" iterations="$2"
-    if ! _has_cmd shred; then
-        warn "shred not found — falling back to pattern wipe"
-        perform_wipe_with_progress "$device" "pattern" "$iterations"
-        return
-    fi
-    local device_bytes; device_bytes=$(get_device_bytes "$device")
-    info "Using shred ($iterations iterations + final zero pass)..."
-    progress_shred "$device" "$iterations" "Shred wipe" \
-        || warn "shred reported an error — check device connection"
-}
-
-verify_wipe() {
-    local device="$1"
-    spinner_start "Verifying wipe (10 MB sample)"
-    local sample
-    sample=$(sudo dd if="$device" bs=1M count=10 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -v '^0*$' || echo "")
-    if [[ -z "$sample" ]]; then
-        spinner_stop 0
-        success "Verification passed — device reads all zeros"
-    else
-        spinner_stop 1
-        warn "Verification: device contains non-zero data (expected for random/pattern wipes)"
-    fi
-}
-
-perform_wipe() {
-    local device="$1" method="$2"
-    case "$method" in
-        1)
-            start_timer "Zero Wipe"
-            perform_wipe_with_progress "$device" "zeros" 1
-            verify_wipe "$device"
-            end_timer "Zero Wipe"
-            ;;
-        2)
-            start_timer "Random Wipe"
-            perform_wipe_with_progress "$device" "random" 1
-            end_timer "Random Wipe"
-            ;;
-        3)
-            start_timer "Shred Wipe (3-pass)"
-            perform_shred_wipe "$device" 3
-            end_timer "Shred Wipe (3-pass)"
-            ;;
-        4)
-            start_timer "DoD 5220.22-M (7-pass)"
-            info "DoD 5220.22-M: 2× random + 3× pattern + 2× random"
-            perform_wipe_with_progress "$device" "random"  2
-            perform_wipe_with_progress "$device" "pattern" 3
-            perform_wipe_with_progress "$device" "random"  2
-            end_timer "DoD 5220.22-M (7-pass)"
-            ;;
-        *)
-            info "Wipe skipped."
-            ;;
-    esac
-}
-
-create_partition() {
-    local device="$1" pt_type="$2"
-    start_timer "Partition Creation"
-
-    case "$pt_type" in
-        1)
-            spinner_start "Creating GPT partition table"
-            sudo parted "$device" --script mklabel gpt 2>/dev/null
-            spinner_stop $?
-            [[ $? -ne 0 ]] && error_exit "Failed to create GPT table on $device"
-            ;;
-        2)
-            spinner_start "Creating MBR partition table"
-            sudo parted "$device" --script mklabel msdos 2>/dev/null
-            spinner_stop $?
-            [[ $? -ne 0 ]] && error_exit "Failed to create MBR table on $device"
-            ;;
-        *)
-            info "Partition table creation skipped." >&2
-            end_timer "Partition Creation"
-            return 1
-            ;;
-    esac
-
-    spinner_start "Writing primary partition (1MiB → 100%)"
-    sudo parted "$device" --script mkpart primary 1MiB 100% 2>/dev/null
-    local rc=$?
-    spinner_stop $rc
-    [[ $rc -ne 0 ]] && error_exit "Failed to create partition on $device"
-
-    sudo parted "$device" --script set 1 boot on 2>/dev/null || true
-
-    spinner_start "Refreshing kernel partition table"
-    sync
-    sudo partprobe "$device" 2>/dev/null || sudo blockdev --rereadpt "$device" 2>/dev/null || true
-    sleep 3
-    spinner_stop 0
-
-    
-    local part=""
-    if [[ "$device" =~ (nvme|mmcblk|loop) ]]; then
-        part="${device}p1"
-    else
-        part="${device}1"
-    fi
-
-    spinner_start "Waiting for $part node to appear"
-    local retry=0
-    while [[ ! -b "$part" && $retry -lt 10 ]]; do
-        sleep 1; ((retry++))
-        if [[ $retry -eq 5 ]]; then
-            if [[ "$device" =~ (nvme|mmcblk|loop) ]]; then
-                part="${device}1"
-            else
-                part="${device}p1"
-            fi
-            info "Trying alternative partition name: $part" >&2
+_exec_draw_steps() {
+    local active_step=$1
+    local step_row=5
+    local si
+    for (( si=0; si<${#EXEC_STEPS[@]}; si++ )); do
+        move $(( step_row + si )) 3
+        if (( si < active_step )); then
+            printf "  %b✓%b  %b%s%b%*s" "$LG" "$RST" "$DK" "${EXEC_STEPS[$si]}" "$RST" 4 ''
+        elif (( si == active_step )); then
+            printf "  %b▶%b  %b%b%s%b%*s" "$LC" "$RST" "$LW" "$BO" "${EXEC_STEPS[$si]}" "$RST" 4 ''
+        else
+            printf "  %b○  %s%b%*s" "$DK" "${EXEC_STEPS[$si]}" "$RST" 4 ''
         fi
     done
+}
 
-    if [[ ! -b "$part" ]]; then
-        spinner_stop 1
-        error_exit "Partition node '$part' never appeared after 10s.\nTry manually: sudo partprobe $device && lsblk $device"
-    fi
-    spinner_stop 0
+_exec_log() {
+    move "$EXEC_LOG_ROW" 3
+    printf "%b[%s]%b %s%*s" "$DK" "$(date +'%H:%M:%S')" "$RST" "$1" \
+        $(( TW - ${#1} - 15 )) ''
+    (( EXEC_LOG_ROW++ ))
+    (( EXEC_LOG_ROW > TH - 3 )) && EXEC_LOG_ROW=$(( EXEC_LOG_ROW - 5 ))
+}
 
-    end_timer "Partition Creation"
-    echo "$part"  
+_exec_ok() {
+    move "$EXEC_LOG_ROW" 3
+    printf "%b✓%b %s%*s" "$LG" "$RST" "$1" $(( TW - ${#1} - 6 )) ''
+    (( EXEC_LOG_ROW++ ))
+}
+
+_exec_err() {
+    move "$EXEC_LOG_ROW" 3
+    printf "%b%b✗ ERROR: %s%b" "$LR" "$BO" "$1" "$RST"
+    (( EXEC_LOG_ROW++ ))
+    move $(( EXEC_LOG_ROW + 1 )) 3
+    printf "%bPress any key to exit...%b" "$DK" "$RST"
+    printf "%b" "$SHOW"
+    read -rsn1
+    tui_quit 1
+}
+
+_exec_warn() {
+    move "$EXEC_LOG_ROW" 3
+    printf "%b⚠  %s%b%*s" "$Y" "$1" "$RST" $(( TW - ${#1} - 6 )) ''
+    (( EXEC_LOG_ROW++ ))
 }
 
 
-setup_encryption() {
-    local part="$1" mapper_name="$2"
+screen_execute() {
+    [[ $CONFIRMED -ne 1 ]] && return
 
-    if ! _has_cmd cryptsetup; then
-        warn "cryptsetup not found — skipping encryption" >&2
-        echo "$part"   # return the raw partition path
-        return 0
-    fi
+    draw_chrome
+    get_term_size
 
-    start_timer "LUKS Encryption Setup"
+    local dev_bytes; dev_bytes=$(get_device_bytes "$SEL_DEVICE")
 
-    info "Setting up LUKS2 encryption (AES-XTS-512 + argon2id)..." >&2
-    printf '\n%b  \uf071  You will be prompted for a passphrase TWICE.%b\n\n' "${YELLOW}" "${RESET}" >&2
+    move 3 3
+    printf "%b%b  Executing operations on:%b  %b%b%s%b  %b%s%b" \
+        "$C" "$BO" "$RST" "$LW" "$BO" "$SEL_DEVICE" "$RST" \
+        "$DK" "$(lsblk -nd -o SIZE,MODEL "$SEL_DEVICE" 2>/dev/null | tr -s ' ')" "$RST"
+    hline 4 1 "$TW" '─' "$DK"
+
+    EXEC_STEPS=()
+    [[ $SEL_WIPE    -ne 0 ]] && EXEC_STEPS+=("Wipe device")
+    EXEC_STEPS+=("Create partition table")
+    [[ $SEL_ENCRYPT -eq 1 ]] && EXEC_STEPS+=("Setup LUKS2 encryption")
+    EXEC_STEPS+=("Format filesystem")
+    [[ $SEL_MOUNT   -eq 1 ]] && EXEC_STEPS+=("Mount device")
+
+    local total_steps=${#EXEC_STEPS[@]}
+    local work_row=$(( 5 + total_steps + 2 ))
+    hline $(( 5 + total_steps + 1 )) 1 "$TW" '─' "$DK"
+
+    EXEC_LOG_ROW=$(( work_row + 1 ))
+
+    local active_step=0
+    local PART="" MAPPED_DEV="" MOUNT_NAME="$SEL_MOUNTNAME"
+    local rc=0
+
+    _exec_draw_steps 0
 
    
-    if ! sudo cryptsetup luksFormat \
-            --type luks2 \
-            --cipher aes-xts-plain64 \
-            --key-size 512 \
-            --hash sha512 \
-            --pbkdf argon2id \
-            --iter-time 4000 \
-            --use-random \
-            "$part"; then
-        error_exit "luksFormat failed on $part\nCheck: device is writable, not mounted, and passphrase was entered correctly"
+    local mounted_parts part
+    mounted_parts=$(mount | grep "^$SEL_DEVICE" | awk '{print $1}' || true)
+    if [[ -n "$mounted_parts" ]]; then
+        _exec_log "Unmounting existing partitions..."
+        while IFS= read -r part; do
+            [[ -z "$part" ]] && continue
+            if sudo umount "$part" 2>/dev/null; then
+                _exec_ok "Unmounted $part"
+            else
+                sudo umount -l "$part" 2>/dev/null \
+                    && _exec_warn "Lazy-unmounted $part" \
+                    || _exec_warn "Could not unmount $part"
+            fi
+        done <<< "$mounted_parts"
+        sync; sleep 1
     fi
 
-    spinner_start "Opening encrypted container"
-    sudo cryptsetup open "$part" "$mapper_name" 2>/dev/null
-    local rc=$?
-    spinner_stop $rc
-    if [[ $rc -ne 0 ]]; then
-        error_exit "Could not open LUKS container on $part\nPossible causes: wrong passphrase, device disconnected, or cryptsetup permissions"
+ 
+    if [[ $SEL_WIPE -ne 0 ]]; then
+        _exec_draw_steps $active_step
+        local wipe_prog_row=$work_row
+        local wipe_prog_col=5
+
+        case $SEL_WIPE in
+        1)  _exec_log "Starting zero-fill wipe..."
+            run_dd_pass /dev/zero "$SEL_DEVICE" "Zero fill" "$dev_bytes" \
+                "$wipe_prog_row" "$wipe_prog_col" || _exec_warn "dd ended at device boundary (normal)"
+            sync; _exec_ok "Zero wipe complete" ;;
+        2)  _exec_log "Starting random wipe..."
+            run_dd_pass /dev/urandom "$SEL_DEVICE" "Random wipe" "$dev_bytes" \
+                "$wipe_prog_row" "$wipe_prog_col" || _exec_warn "dd ended at device boundary (normal)"
+            sync; _exec_ok "Random wipe complete" ;;
+        3)  _exec_log "Starting shred (3-pass)..."
+            run_shred_pass "$SEL_DEVICE" 3 "$wipe_prog_row" "$wipe_prog_col" \
+                || _exec_err "shred failed — device may be disconnected"
+            _exec_ok "Shred complete" ;;
+        4)  _exec_log "Starting DoD 7-pass wipe..."
+            local p
+            _exec_log "Pass group 1/3: 2× zeros"
+            for p in 1 2; do
+                run_dd_pass /dev/zero "$SEL_DEVICE" "DoD zeros pass $p/7" "$dev_bytes" \
+                    "$wipe_prog_row" "$wipe_prog_col" || true
+                sync
+            done
+            _exec_log "Pass group 2/3: 3× random"
+            for p in 3 4 5; do
+                run_dd_pass /dev/urandom "$SEL_DEVICE" "DoD random pass $p/7" "$dev_bytes" \
+                    "$wipe_prog_row" "$wipe_prog_col" || true
+                sync
+            done
+            _exec_log "Pass group 3/3: 2× zeros"
+            for p in 6 7; do
+                run_dd_pass /dev/zero "$SEL_DEVICE" "DoD zeros pass $p/7" "$dev_bytes" \
+                    "$wipe_prog_row" "$wipe_prog_col" || true
+                sync
+            done
+            _exec_ok "DoD 7-pass wipe complete" ;;
+        esac
+        (( active_step++ ))
     fi
 
-    local mapped="/dev/mapper/$mapper_name"
-    end_timer "LUKS Encryption Setup"
-    success "Encryption active → $mapped" >&2
-    echo "$mapped"   # stdout only
-}
+  
+    _exec_draw_steps $active_step
+    local pt_name; [[ $SEL_PTABLE -eq 1 ]] && pt_name="gpt" || pt_name="msdos"
+    local pt_label; [[ $SEL_PTABLE -eq 1 ]] && pt_label="GPT" || pt_label="MBR"
 
+    spin_start "$work_row" 5 "Creating $pt_label partition table"
+    sudo parted "$SEL_DEVICE" --script mklabel "$pt_name" 2>/dev/null; rc=$?
+    spin_stop "$work_row" 5 "Partition table: $pt_label" $(( rc==0 ? 1 : 0 ))
+    [[ $rc -ne 0 ]] && _exec_err "Failed to create partition table on $SEL_DEVICE"
 
-format_filesystem() {
-    local device="$1" fstype="$2" label="${3:0:15}"
+    EXEC_LOG_ROW=$(( work_row + 2 ))
+    spin_start "$EXEC_LOG_ROW" 5 "Creating primary partition (100%)"
+    sudo parted "$SEL_DEVICE" --script mkpart primary 1MiB 100% 2>/dev/null; rc=$?
+    spin_stop "$EXEC_LOG_ROW" 5 "Primary partition created" $(( rc==0 ? 1 : 0 ))
+    [[ $rc -ne 0 ]] && _exec_err "Failed to create partition on $SEL_DEVICE"
 
-    case "$fstype" in
-        1)
-            _has_cmd mkfs.ext4 || error_exit "mkfs.ext4 not found — sudo apt install e2fsprogs"
-            start_timer "ext4 Format"
-            spinner_start "Formatting ext4  [label: $label]"
-            sudo mkfs.ext4 -F -L "$label" -O ^64bit,^metadata_csum \
-                -E lazy_itable_init=0,lazy_journal_init=0 "$device" &>/dev/null
-            local rc=$?; spinner_stop $rc
-            [[ $rc -ne 0 ]] && error_exit "mkfs.ext4 failed on $device\nCheck: device is accessible and not in use"
-            end_timer "ext4 Format"
-            ;;
-        2)
-            if ! _has_cmd mkfs.exfat; then
-                warn "mkfs.exfat not found — falling back to FAT32"
-                format_filesystem "$device" 3 "$label"; return
-            fi
-            start_timer "exFAT Format"
-            spinner_start "Formatting exFAT  [label: $label]"
-            sudo mkfs.exfat -n "$label" "$device" &>/dev/null
-            local rc=$?; spinner_stop $rc
-            [[ $rc -ne 0 ]] && error_exit "mkfs.exfat failed on $device\nInstall: sudo apt install exfatprogs"
-            end_timer "exFAT Format"
-            ;;
-        3)
-            if ! _has_cmd mkfs.vfat; then
-                warn "mkfs.vfat not found — falling back to ext4"
-                format_filesystem "$device" 1 "$label"; return
-            fi
-            local fat_label="${label:0:11}"
-            start_timer "FAT32 Format"
-            spinner_start "Formatting FAT32  [label: $fat_label]"
-            sudo mkfs.vfat -F 32 -n "$fat_label" "$device" &>/dev/null
-            local rc=$?; spinner_stop $rc
-            [[ $rc -ne 0 ]] && error_exit "mkfs.vfat failed on $device\nInstall: sudo apt install dosfstools"
-            end_timer "FAT32 Format"
-            ;;
-        4)
-            if ! _has_cmd mkfs.ntfs; then
-                warn "mkfs.ntfs not found — falling back to ext4"
-                format_filesystem "$device" 1 "$label"; return
-            fi
-            start_timer "NTFS Format"
-            spinner_start "Formatting NTFS  [label: $label]"
-            sudo mkfs.ntfs -f -L "$label" "$device" &>/dev/null
-            local rc=$?; spinner_stop $rc
-            [[ $rc -ne 0 ]] && error_exit "mkfs.ntfs failed on $device\nInstall: sudo apt install ntfs-3g"
-            end_timer "NTFS Format"
-            ;;
-        *)
-            info "Filesystem formatting skipped."
-            return 0
-            ;;
-    esac
+    (( EXEC_LOG_ROW++ ))
+    spin_start "$EXEC_LOG_ROW" 5 "Refreshing kernel partition table"
     sync
-    success "Filesystem created successfully"
-}
+    sudo partprobe "$SEL_DEVICE" 2>/dev/null || sudo blockdev --rereadpt "$SEL_DEVICE" 2>/dev/null || true
+    sleep 3
 
-
-mount_device() {
-    local device="$1" mount_name="$2"
-    local mount_dir="/mnt/$mount_name"
-    start_timer "Device Mount"
-
-    spinner_start "Creating mount point $mount_dir"
-    sudo mkdir -p "$mount_dir" 2>/dev/null
-    spinner_stop $?
-
-    spinner_start "Mounting $device → $mount_dir"
-    sudo mount "$device" "$mount_dir" 2>/dev/null
-    local rc=$?
-    spinner_stop $rc
-    if [[ $rc -ne 0 ]]; then
-        error_exit "mount failed for '$device' → '$mount_dir'\nCommon causes: wrong filesystem, encrypted device not opened, device not formatted"
+    if [[ "$SEL_DEVICE" =~ (nvme|mmcblk|loop) ]]; then
+        PART="${SEL_DEVICE}p1"
+    else
+        PART="${SEL_DEVICE}1"
     fi
 
-    spinner_start "Setting ownership → $USER"
-    sudo chown -R "$USER:$(id -gn)" "$mount_dir" 2>/dev/null || true
-    sudo chmod 755 "$mount_dir"
-    spinner_stop 0
+    local waited=0
+    while [[ ! -b "$PART" && $waited -lt 10 ]]; do sleep 1; (( waited++ )); done
+    if [[ ! -b "$PART" ]]; then
+        [[ "$SEL_DEVICE" =~ (nvme|mmcblk|loop) ]] && PART="${SEL_DEVICE}1" || PART="${SEL_DEVICE}p1"
+        waited=0
+        while [[ ! -b "$PART" && $waited -lt 5 ]]; do sleep 1; (( waited++ )); done
+    fi
 
-    end_timer "Device Mount"
-    success "Mounted at $mount_dir"
+    local part_ok=0; [[ -b "$PART" ]] && part_ok=1
+    spin_stop "$EXEC_LOG_ROW" 5 "Partition node: $PART" $part_ok
+    [[ $part_ok -eq 0 ]] && _exec_err "Partition node $PART never appeared — try: sudo partprobe $SEL_DEVICE"
+    (( EXEC_LOG_ROW++ ))
+    (( active_step++ ))
 
-    printf '%b\n  \uf0a0  Mount Info:%b\n' "${GRAY}" "${RESET}" >&2
-    printf '%b  ┌──────────────────────────────────────────────┐%b\n' "${GRAY}" "${RESET}" >&2
-    df -h "$mount_dir" | tail -1 | while read -r fs size used avail pct mp; do
-        printf '%b  │  Filesystem : %-32s │%b\n' "${RESET}" "$fs"   "${RESET}" >&2
-        printf '%b  │  Size       : %-32s │%b\n' "${RESET}" "$size" "${RESET}" >&2
-        printf '%b  │  Available  : %-32s │%b\n' "${RESET}" "$avail" "${RESET}" >&2
-        printf '%b  │  Used       : %-32s │%b\n' "${RESET}" "$pct"  "${RESET}" >&2
-        printf '%b  │  Mountpoint : %-32s │%b\n' "${RESET}" "$mp"   "${RESET}" >&2
-    done
-    printf '%b  └──────────────────────────────────────────────┘%b\n\n' "${GRAY}" "${RESET}" >&2
-}
+   
+    MAPPED_DEV="$PART"
+    if [[ $SEL_ENCRYPT -eq 1 ]]; then
+        _exec_draw_steps $active_step
+        MAPPER_NAME="usb_nuke_$(date +%s)"
+        [[ -b "/dev/mapper/$MAPPER_NAME" ]] && \
+            sudo cryptsetup close "$MAPPER_NAME" 2>/dev/null || true
 
+        move "$EXEC_LOG_ROW" 3; (( EXEC_LOG_ROW++ ))
+        printf "%b  You will be prompted for a passphrase TWICE.%b" "$Y" "$RST"
+        move "$EXEC_LOG_ROW" 3; (( EXEC_LOG_ROW++ ))
+        printf "%b" "$SHOW"
 
-show_operation_summary() {
-    local total=$(( $(date +%s) - SCRIPT_START_TIME ))
-    printf '\n%b  ╔══ OPERATION SUMMARY ═════════════════════════╗%b\n' "${BOLD}${CYAN}" "${RESET}" >&2
-    for key in "${!OPERATION_TIMES[@]}"; do
-        if [[ $key == *"_duration" ]]; then
-            local name="${key%_duration}" dur="${OPERATION_TIMES[$key]}"
-            printf '%b  ║  %-28s %14s  ║%b\n' "${RESET}" "$name" "$(format_duration "$dur")" "${RESET}" >&2
+        sudo cryptsetup luksFormat \
+            --type luks2 --cipher aes-xts-plain64 \
+            --key-size 512 --hash sha512 \
+            --pbkdf argon2id --iter-time 4000 \
+            --use-random "$PART" 2>/dev/null
+        rc=$?
+        printf "%b" "$HIDE"
+        [[ $rc -ne 0 ]] && _exec_err "luksFormat failed — bad passphrase or device error"
+
+        spin_start "$EXEC_LOG_ROW" 5 "Opening encrypted container"
+        sudo cryptsetup open "$PART" "$MAPPER_NAME" 2>/dev/null; rc=$?
+        spin_stop "$EXEC_LOG_ROW" 5 "LUKS2 container: /dev/mapper/$MAPPER_NAME" $(( rc==0 ? 1 : 0 ))
+        [[ $rc -ne 0 ]] && _exec_err "Could not open LUKS container"
+        MAPPED_DEV="/dev/mapper/$MAPPER_NAME"
+        (( EXEC_LOG_ROW++ ))
+        (( active_step++ ))
+    fi
+
+  
+    _exec_draw_steps $active_step
+    local label="${SEL_LABEL:0:15}"
+
+    spin_start "$EXEC_LOG_ROW" 5 "Formatting filesystem"
+    case $SEL_FS in
+    1)  sudo mkfs.ext4 -F -L "$label" \
+            -O ^64bit,^metadata_csum \
+            -E lazy_itable_init=0,lazy_journal_init=0 \
+            "$MAPPED_DEV" &>/dev/null; rc=$?
+        spin_stop "$EXEC_LOG_ROW" 5 "ext4 formatted  (label: $label)" $(( rc==0 ? 1 : 0 )) ;;
+    2)  sudo mkfs.exfat -n "$label" "$MAPPED_DEV" &>/dev/null; rc=$?
+        spin_stop "$EXEC_LOG_ROW" 5 "exFAT formatted  (label: $label)" $(( rc==0 ? 1 : 0 )) ;;
+    3)  local fat_label="${label:0:11}"
+        sudo mkfs.vfat -F 32 -n "$fat_label" "$MAPPED_DEV" &>/dev/null; rc=$?
+        spin_stop "$EXEC_LOG_ROW" 5 "FAT32 formatted  (label: $fat_label)" $(( rc==0 ? 1 : 0 )) ;;
+    4)  sudo mkfs.ntfs -f -L "$label" "$MAPPED_DEV" &>/dev/null; rc=$?
+        spin_stop "$EXEC_LOG_ROW" 5 "NTFS formatted  (label: $label)" $(( rc==0 ? 1 : 0 )) ;;
+    esac
+    [[ $rc -ne 0 ]] && _exec_err "Filesystem formatting failed on $MAPPED_DEV"
+    sync
+    (( EXEC_LOG_ROW++ ))
+    (( active_step++ ))
+
+    if [[ $SEL_MOUNT -eq 1 ]]; then
+        _exec_draw_steps $active_step
+        local mount_dir="/mnt/$MOUNT_NAME"
+
+        spin_start "$EXEC_LOG_ROW" 5 "Mounting $MAPPED_DEV → $mount_dir"
+        sudo mkdir -p "$mount_dir" 2>/dev/null
+        sudo mount "$MAPPED_DEV" "$mount_dir" 2>/dev/null; rc=$?
+        spin_stop "$EXEC_LOG_ROW" 5 "Mounted: $mount_dir" $(( rc==0 ? 1 : 0 ))
+        if [[ $rc -eq 0 ]]; then
+            sudo chown -R "$USER:$(id -gn)" "$mount_dir" 2>/dev/null || true
+            sudo chmod 755 "$mount_dir"
+        else
+            _exec_warn "Mount failed — mount manually: sudo mount $MAPPED_DEV $mount_dir"
         fi
-    done
-    printf '%b  ║  %-28s %14s  ║%b\n' "${BOLD}" "TOTAL RUNTIME" "$(format_duration "$total")" "${RESET}" >&2
-    printf '%b  ╚═══════════════════════════════════════════════╝%b\n' "${BOLD}${CYAN}" "${RESET}" >&2
+        (( EXEC_LOG_ROW++ ))
+        (( active_step++ ))
+    fi
+
+    _exec_draw_steps "$total_steps"
+    hline $(( EXEC_LOG_ROW + 1 )) 1 "$TW" '─' "$DK"
+
+    screen_done "$PART" "$MAPPED_DEV" "$MOUNT_NAME"
 }
 
-MAPPER_NAME_GLOBAL=""
-cleanup() {
-    local code=$?
-    _spinner_stop
-    printf "${SHOW_CURSOR}" >&2
+
+screen_done() {
+    local part="$1" mapped="$2" mount_name="$3"
+    get_term_size
+
+    local total_elapsed=$(( $(date +%s) - SCRIPT_START ))
+    local bw=$(( TW - 8 ))
+    local br=$(( TH - 16 ))
+    (( br < 3 )) && br=3
+
+    draw_box "$br" 4 14 "$bw" "$G" "✓  Operation Complete"
+
+    local r=$(( br + 2 ))
+    move "$r" 8; (( r++ ))
+    printf "%b%b  USB drive prepared successfully in %s%b" "$LG" "$BO" "$(fmt_dur "$total_elapsed")" "$RST"
+
+    (( r++ ))
+    local wipe_names=("None" "Zero fill" "Random" "Shred 3-pass" "DoD 7-pass")
+    local fs_names=("" "ext4" "exFAT" "FAT32" "NTFS")
+    local pt_names=("" "GPT" "MBR")
+
+    move "$r" 8; (( r++ )); printf "  %bDevice    :%b  %b%s%b" "$DK" "$RST" "$LW" "$SEL_DEVICE" "$RST"
+    move "$r" 8; (( r++ )); printf "  %bPartition :%b  %b%s%b" "$DK" "$RST" "$LW" "$part" "$RST"
+    move "$r" 8; (( r++ ))
+    printf "  %bWipe      :%b  %b%s%b    %bPartition table:%b  %b%s%b" \
+        "$DK" "$RST" "$LW" "${wipe_names[$SEL_WIPE]}" "$RST" \
+        "$DK" "$RST" "$LW" "${pt_names[$SEL_PTABLE]}" "$RST"
+    move "$r" 8; (( r++ ))
+    printf "  %bFilesystem:%b  %b%s%b    %bLabel:%b  %b%s%b" \
+        "$DK" "$RST" "$LW" "${fs_names[$SEL_FS]}" "$RST" \
+        "$DK" "$RST" "$LW" "$SEL_LABEL" "$RST"
+
+    if [[ $SEL_ENCRYPT -eq 1 ]]; then
+        move "$r" 8; (( r++ ))
+        printf "  %bEncrypted :%b  %bLUKS2  (/dev/mapper/%s)%b" "$DK" "$RST" "$LG" "$MAPPER_NAME" "$RST"
+    fi
+    if [[ $SEL_MOUNT -eq 1 ]]; then
+        move "$r" 8; (( r++ ))
+        printf "  %bMounted   :%b  %b/mnt/%s%b" "$DK" "$RST" "$LG" "$mount_name" "$RST"
+    fi
+
+    if [[ $SEL_ENCRYPT -eq 1 && -n "$MAPPER_NAME" ]]; then
+        (( r++ ))
+        move "$r" 8; (( r++ ))
+        printf "  %bEncryption cheatsheet:%b" "$C" "$RST"
+        move "$r" 8; (( r++ ))
+        printf "  %bOpen :%b  sudo cryptsetup open %s %s" "$DK" "$RST" "$part" "$MAPPER_NAME"
+        move "$r" 8; (( r++ ))
+        printf "  %bClose:%b  sudo umount /mnt/%s && sudo cryptsetup close %s" \
+            "$DK" "$RST" "$mount_name" "$MAPPER_NAME"
+    fi
+
+    move $(( br + 13 )) 8
+    printf "%b  Press %bq%b to quit, %br%b to run again%b" \
+        "$DK" "$LC" "$DK" "$LC" "$DK" "$RST"
+
+    printf "%b" "$SHOW"
+    while true; do
+        local key; IFS= read -rsn1 key
+        case "$key" in
+            q|Q|$'\x03') tui_quit 0 ;;
+            r|R) main ;;
+        esac
+    done
+}
+
+
+tui_quit() {
+    local code="${1:-0}"
+    if [[ -n "${_SPIN_PID:-}" ]]; then
+        kill -9 "$_SPIN_PID" 2>/dev/null
+        wait "$_SPIN_PID" 2>/dev/null || true
+        _SPIN_PID=""
+    fi
+    [[ $_IN_ALT -eq 1 ]] && printf "%b" "$ALT_OFF"
+    printf "%b\n" "$SHOW"
     if [[ $code -ne 0 ]]; then
-        warn "Script exited with error (code $code)"
-        if [[ -n "$MAPPER_NAME_GLOBAL" && -b "/dev/mapper/$MAPPER_NAME_GLOBAL" ]]; then
-            warn "Auto-closing LUKS mapper '$MAPPER_NAME_GLOBAL'..."
-            sudo cryptsetup close "$MAPPER_NAME_GLOBAL" 2>/dev/null || true
-        fi
-        info "Some operations may need manual cleanup"
+        printf "%bExited with error.%b\n" "$R" "$RST"
     fi
-    show_operation_summary
+    exit "$code"
+}
+
+_on_exit() {
+    local code=$?
+    if [[ -n "${_SPIN_PID:-}" ]]; then
+        kill -9 "$_SPIN_PID" 2>/dev/null
+        wait "$_SPIN_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${MAPPER_NAME:-}" && -b "/dev/mapper/${MAPPER_NAME:-}" ]]; then
+        sudo cryptsetup close "$MAPPER_NAME" 2>/dev/null || true
+    fi
+    [[ $_IN_ALT -eq 1 ]] && printf "%b" "$ALT_OFF"
+    printf "%b" "$SHOW"
     exit $code
 }
 
 
 main() {
-    trap cleanup EXIT
-
-    show_banner
-    check_root
-    check_dependencies
-
-    # ── Device selection ──────────────────────────────────────
-    show_devices
-
-    [[ ${#REMOVABLE_DEVICES[@]} -eq 0 ]] && error_exit "No removable devices found"
-
-    local DEVICE=""
-    if [[ ${#REMOVABLE_DEVICES[@]} -eq 1 ]]; then
-        DEVICE="${REMOVABLE_DEVICES[0]}"
-        info "Auto-selecting only available device: $DEVICE"
-    else
-        printf '%b  Select USB device (number or full path):%b\n' "${CYAN}" "${RESET}" >&2
-        local choice
-        choice=$(read_with_timeout "  Choice (1-${#REMOVABLE_DEVICES[@]})" 30) \
-            || error_exit "No device selected (timeout)"
-        [[ -z "$choice" ]] && error_exit "No device specified"
-
-        if validate_numeric_choice "$choice" 1 "${#REMOVABLE_DEVICES[@]}"; then
-            DEVICE="${REMOVABLE_DEVICES[$((choice-1))]}"
-        elif [[ "$choice" =~ ^/dev/.+ && -b "$choice" ]]; then
-            DEVICE="$choice"
-        else
-            error_exit "Invalid selection: '$choice' — enter a number (1-${#REMOVABLE_DEVICES[@]}) or /dev/sdX path"
-        fi
+    get_term_size
+    if (( TW < 90 || TH < 24 )); then
+        printf "%bTerminal too small. Minimum: 90×24. Current: %dx%d%b\n" "$Y" "$TW" "$TH" "$RST"
+        printf "Resize your terminal and re-run.\n"
+        exit 1
     fi
 
-    validate_device "$DEVICE"
-    pre_nuke_verification "$DEVICE"
+    trap '_on_exit' EXIT
+    trap 'tui_quit 130' INT TERM
 
-    # ── Double confirmation ───────────────────────────────────
-    printf '\n%b  \uf071  FINAL CONFIRMATION REQUIRED%b\n\n' "${RED}${BOLD}" "${RESET}" >&2
+    printf "%b%b" "$ALT_ON" "$HIDE"
+    _IN_ALT=1
 
-    printf '%b  Step 1: Type the exact device path: %b%s%b\n' "${YELLOW}" "${CYAN}${BOLD}" "$DEVICE" "${RESET}" >&2
-    local device_confirm
-    read -rp "  Device path: " device_confirm
-    if [[ "$device_confirm" != "$DEVICE" ]]; then
-        error_exit "Device path mismatch.\n  You typed : '$device_confirm'\n  Expected  : '$DEVICE'\n  Aborted for your safety."
-    fi
-    success "Device path confirmed"
-
-    printf '\n%b  Step 2: Type exactly %bNUKE IT%b to proceed%b\n' "${YELLOW}" "${RED}${BOLD}" "${YELLOW}" "${RESET}" >&2
-    local nuke_confirm
-    read -rp "  Confirmation: " nuke_confirm
-    if [[ "$nuke_confirm" != "NUKE IT" ]]; then
-        error_exit "Confirmation failed.\n  You typed : '$nuke_confirm'\n  Expected  : 'NUKE IT'\n  Operation aborted."
-    fi
-    success "Final confirmation received"
-
-    # ── Prepare device ────────────────────────────────────────
-    printf '\n%b  \uf06e  Preparing device for wipe...%b\n' "${CYAN}${BOLD}" "${RESET}" >&2
-    local mounted_parts
-    mounted_parts=$(mount | grep "^$DEVICE" | awk '{print $1}' || true)
-    if [[ -n "$mounted_parts" ]]; then
-        info "Unmounting all partitions on $DEVICE..."
-        while IFS= read -r part; do
-            [[ -z "$part" ]] && continue
-            spinner_start "Unmounting $part"
-            if sudo umount "$part" 2>/dev/null; then
-                spinner_stop 0
-            else
-                spinner_stop 1
-                warn "Normal umount failed for '$part' — trying lazy unmount"
-                sudo umount -l "$part" 2>/dev/null \
-                    && warn "Lazy unmount applied to $part" \
-                    || warn "Could not unmount $part — this may cause write errors"
-            fi
-        done <<< "$mounted_parts"
-        sync; sleep 2
-    fi
-
-    # ── Wipe ─────────────────────────────────────────────────
-    echo "" >&2
-    printf '%b  \uf06e  Choose wipe method:%b\n' "${CYAN}" "${RESET}" >&2
-    echo "    1) Zero fill         (fast, single pass, verified)" >&2
-    echo "    2) Random data       (secure, single pass)"         >&2
-    echo "    3) Shred             (secure, 3-pass via shred)"    >&2
-    echo "    4) DoD 5220.22-M     (very secure, 7-pass)"         >&2
-    echo "    5) Skip wipe"                                        >&2
-
-    local WIPE_METHOD
-    WIPE_METHOD=$(read_with_timeout "  Select (1-5)" 30 "1") || { warn "Timeout — using zero fill"; WIPE_METHOD=1; }
-    validate_numeric_choice "$WIPE_METHOD" 1 5 || { warn "Invalid — defaulting to zero fill"; WIPE_METHOD=1; }
-    perform_wipe "$DEVICE" "$WIPE_METHOD"
-
-    # ── Partition table ───────────────────────────────────────
-    echo "" >&2
-    printf '%b  \uf0c8  Choose partition table:%b\n' "${CYAN}" "${RESET}" >&2
-    echo "    1) GPT  (recommended — modern systems, >2TB)" >&2
-    echo "    2) MBR  (legacy compatible)"                   >&2
-    echo "    3) Skip partitioning"                          >&2
-
-    local PT_TYPE
-    PT_TYPE=$(read_with_timeout "  Select (1-3)" 30 "1") || { warn "Timeout — using GPT"; PT_TYPE=1; }
-    validate_numeric_choice "$PT_TYPE" 1 3 || { warn "Invalid — defaulting to GPT"; PT_TYPE=1; }
-
-    local PART=""
-    if [[ "$PT_TYPE" =~ ^[12]$ ]]; then
-        PART=$(create_partition "$DEVICE" "$PT_TYPE") \
-            || error_exit "Partitioning failed on $DEVICE — check dmesg for kernel errors"
-        [[ -z "$PART" ]] && error_exit "create_partition returned empty path — unexpected error"
-    else
-        info "Partitioning skipped — manual partition creation will be required"
-        show_operation_summary
-        exit 0
-    fi
-
-    # ── Label ─────────────────────────────────────────────────
-    local LABEL
-    LABEL=$(read_with_timeout "  Filesystem label" 30 "NUKED") || LABEL="NUKED"
-    LABEL="${LABEL:-NUKED}"
-
-    # ── Encryption ────────────────────────────────────────────
-    echo "" >&2
-    local do_encrypt
-    do_encrypt=$(read_with_timeout "  \uf023 Encrypt with LUKS2? (y/N)" 30 "N") || do_encrypt="N"
-
-    local MAPPED_DEV=""
-    if [[ "$do_encrypt" =~ ^[Yy]$ ]]; then
-        local mapper_name="usb_nuke_$(date +%s)"
-        MAPPER_NAME_GLOBAL="$mapper_name"
-        MAPPED_DEV=$(setup_encryption "$PART" "$mapper_name") \
-            || error_exit "Encryption setup failed on $PART"
-        [[ -z "$MAPPED_DEV" ]] && error_exit "setup_encryption returned empty path"
-    else
-        MAPPED_DEV="$PART"
-    fi
-
-    # ── Filesystem ────────────────────────────────────────────
-    echo "" >&2
-    printf '%b  \uf0a0  Choose filesystem:%b\n' "${CYAN}" "${RESET}" >&2
-    echo "    1) ext4   — Linux native, journaled"            >&2
-    echo "    2) exFAT  — cross-platform, large files (>4GB)" >&2
-    echo "    3) FAT32  — universal compatibility"            >&2
-    echo "    4) NTFS   — Windows native"                     >&2
-    echo "    5) Skip formatting"                              >&2
-
-    local FSTYPE
-    FSTYPE=$(read_with_timeout "  Select (1-5)" 30 "1") || { warn "Timeout — using ext4"; FSTYPE=1; }
-    validate_numeric_choice "$FSTYPE" 1 5 || { warn "Invalid — defaulting to ext4"; FSTYPE=1; }
-    format_filesystem "$MAPPED_DEV" "$FSTYPE" "$LABEL"
-
-    # ── Mount ─────────────────────────────────────────────────
-    echo "" >&2
-    local do_mount
-    do_mount=$(read_with_timeout "  \uf74a Mount device now? (y/N)" 30 "N") || do_mount="N"
-
-    if [[ "$do_mount" =~ ^[Yy]$ ]]; then
-        local MOUNT_NAME
-        MOUNT_NAME=$(read_with_timeout "  Mount directory name" 30 "nuked") || MOUNT_NAME="nuked"
-        MOUNT_NAME="${MOUNT_NAME:-nuked}"
-        mount_device "$MAPPED_DEV" "$MOUNT_NAME"
-    fi
-
-    # ── Final summary ─────────────────────────────────────────
-    echo "" >&2
-    printf '%b  ╔══ \uf00c SUCCESS ══════════════════════════════════╗%b\n' "${GREEN}${BOLD}" "${RESET}" >&2
-    printf '%b  ║  USB Nuke Beast operation completed!           ║%b\n' "${GREEN}${BOLD}"   "${RESET}" >&2
-    printf '%b  ║  \uf7c8  Device %-38s ║%b\n' "${GREEN}" "$DEVICE is ready" "${RESET}" >&2
-    printf '%b  ╚═══════════════════════════════════════════════╝%b\n' "${GREEN}${BOLD}" "${RESET}" >&2
-
-    if [[ "$do_encrypt" =~ ^[Yy]$ ]]; then
-        echo "" >&2
-        printf '%b  \uf084 Encryption cheatsheet:%b\n' "${CYAN}" "${RESET}" >&2
-        echo "    Open  : sudo cryptsetup open $PART ${MAPPER_NAME_GLOBAL:-nuked_usb}" >&2
-        echo "    Mount : sudo mount /dev/mapper/${MAPPER_NAME_GLOBAL:-nuked_usb} /mnt/${MOUNT_NAME:-nuked}" >&2
-        echo "    Close : sudo umount /mnt/${MOUNT_NAME:-nuked} && sudo cryptsetup close ${MAPPER_NAME_GLOBAL:-nuked_usb}" >&2
-        echo "    Info  : sudo cryptsetup luksDump $PART" >&2
-        echo "    \uf071  Keep your passphrase safe — no recovery without it!" >&2
-    fi
+    screen_splash
+    screen_device_select
+    screen_configure
+    screen_confirm
+    screen_execute
 }
 
 main "$@"
